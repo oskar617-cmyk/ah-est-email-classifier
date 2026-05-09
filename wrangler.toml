@@ -1,0 +1,19 @@
+# Cloudflare Worker config for AH Estimating's Gemini classifier proxy.
+#
+# IMPORTANT: `name` MUST stay "ah-estimating-classifier" — that matches the
+# existing deployed Worker. Changing it would cause Cloudflare to create a
+# duplicate Worker on next deploy and the PWA's CONFIG.classifierUrl would
+# stop resolving.
+#
+# Secrets and runtime variables are NOT defined here:
+#   - GEMINI_API_KEY  -> Cloudflare dashboard -> Settings -> Variables and Secrets (Type: Secret)
+#   - CORS_ORIGINS    -> Cloudflare dashboard -> Settings -> Variables and Secrets (Type: Text)
+#                        currently set to: https://oskar617-cmyk.github.io
+#
+# `compatibility_date` is the snapshot of the Workers runtime to use. Pin
+# rather than auto-rolling so a Cloudflare runtime change can never silently
+# break this Worker. Bump deliberately if/when needed.
+
+name = "ah-estimating-classifier"
+main = "worker.js"
+compatibility_date = "2025-09-01"
