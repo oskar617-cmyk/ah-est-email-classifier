@@ -63,3 +63,4 @@ README.md          This file
 
 - **Cloudflare Workers:** 100,000 requests/day, 10ms CPU per request. Wait time on `fetch` to Gemini doesn't count as CPU, so we fit comfortably.
 - **Gemini API (free tier):** 1,500 requests/day for `gemini-2.5-flash`. At ~3 calls per supplier reply, that covers ~500 replies/day — far above real usage.
+
