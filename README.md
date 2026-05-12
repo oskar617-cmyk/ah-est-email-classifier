@@ -64,3 +64,40 @@ README.md          This file
 - **Cloudflare Workers:** 100,000 requests/day, 10ms CPU per request. Wait time on `fetch` to Gemini doesn't count as CPU, so we fit comfortably.
 - **Gemini API (free tier):** 1,500 requests/day for `gemini-2.5-flash`. At ~3 calls per supplier reply, that covers ~500 replies/day — far above real usage.
 
+## Tuning Workflow
+
+Tuning is done in a dedicated Claude sub-chat off the main "AH Estimating" project. The cycle:
+
+1. **Collect data in the PWA.** As supplier replies come in, the PWA logs every Gemini decision plus how you reacted (Confirmed / Edited / Rejected, with original input, Gemini's output, your correction, and an optional "why" note).
+2. **Export.** PWA → Settings → AI Tuning → **Export For Analysis**. Produces a markdown file named `gemini-decisions-YYYY-MM-DD.md`. Each export starts from the last export timestamp, so you never reanalyse the same decisions twice.
+3. **Paste into the sub-chat.** Open the "AH Est Email Classifier" sub-chat in Claude and attach (or paste) the markdown export.
+4. **Diagnosis before code.** Claude analyses for patterns, tells you in plain language what it thinks Gemini is getting wrong systematically, and waits for you to confirm before writing any code. A bad prompt edit is worse than no edit.
+5. **Tuned `worker.js`.** Once you confirm the diagnosis, Claude produces a full updated `worker.js` bundled as `ah-est-email-classifier-[short-summary].zip`, with a clear note of what changed in the prompts.
+6. **Drop into this repo.** Drag the new `worker.js` into the GitHub web UI (overwriting the old one), commit to `main`.
+7. **Auto-deploy.** Cloudflare detects the commit and deploys within ~30 seconds. Next supplier reply uses the smarter prompt.
+8. **Rollback if needed.** If a tuning round makes things worse: GitHub → Commits → revert that commit, OR Cloudflare Worker → Settings → Version History → restore the previous version. Either path puts the old prompts back in <1 minute.
+
+### What stays the same across tuning rounds
+
+- Worker name (`ah-estimating-classifier`)
+- Worker URL
+- Three tasks: `classify`, `extractAmount`, `summarizeFilename`
+- Request/response contract (see Endpoint Contract above)
+- The six classification values (Quote / Question / Suspicious / Out-of-Office / Decline / Unrelated)
+- Gemini model (`gemini-2.5-flash` — only changed with explicit approval)
+
+Tuning is about the *content* of the prompts inside the three task functions, not the Worker's shape.
+
+## Do NOT Convert This Repo With doc-dropper
+
+The `doc-dropper` tool's "make repo private" toggle migrates a repo from GitHub Pages hosting to Cloudflare Pages hosting. **This repo is not a GitHub Pages site — it's a Cloudflare Worker deployed via Cloudflare's native Git integration.** Running doc-dropper's conversion against this repo would:
+
+- Create a parallel Cloudflare **Pages** project alongside the existing Worker (different products, different deploy targets, both triggered on every commit)
+- Add a `.github/workflows/deploy.yml` that runs `wrangler pages deploy` on every push — useless here, but pollutes the repo and your Cloudflare account
+- Add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` GitHub Secrets that this repo doesn't need
+
+The Worker itself wouldn't break (Cloudflare's API treats Workers and Pages as separate surfaces — `wrangler pages` can't clobber a Worker's config or bindings), but you'd end up with a dead `ah-est-email-classifier.pages.dev` Pages project sitting next to the real Worker, deploying garbage on every commit.
+
+**If doc-dropper is well-behaved, it should refuse to touch any repo containing a `wrangler.toml` at the root.** That file is the canonical "this repo deploys to Cloudflare as a Worker (or other non-Pages target)" marker.
+
+To manage this repo's privacy: use GitHub's own Settings → General → Danger Zone → Change visibility. No tool needed.
