@@ -151,8 +151,14 @@ ${safe(p.attachmentText)}`;
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
 
 async function callGemini(apiKey, prompt) {
+  // Model: gemini-3.1-flash-lite (stable, Flash-Lite tier). Newest stable
+  // Flash-family model as of 2026-05. Optimised for high-volume, low-latency
+  // classification — well-suited to this Worker's three tasks. If quality
+  // ever drops on extractAmount or summarizeFilename, the upgrade path is
+  // gemini-3-flash-preview (more reasoning, but preview-only with
+  // deprecation risk).
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',

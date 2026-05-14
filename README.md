@@ -9,7 +9,7 @@ A Cloudflare Worker that proxies Google Gemini for the **AH Estimating** PWA's e
 ## Tech Stack
 
 - Cloudflare Workers (free tier — 100,000 requests/day)
-- Google Gemini API (`gemini-2.5-flash`)
+- Google Gemini API (`gemini-3.1-flash-lite`)
 - Single-file `worker.js`, no build step, no npm
 
 ## Endpoint Contract
@@ -62,7 +62,7 @@ README.md          This file
 ## Free Tier Limits
 
 - **Cloudflare Workers:** 100,000 requests/day, 10ms CPU per request. Wait time on `fetch` to Gemini doesn't count as CPU, so we fit comfortably.
-- **Gemini API (free tier):** 1,500 requests/day for `gemini-2.5-flash`. At ~3 calls per supplier reply, that covers ~500 replies/day — far above real usage.
+- **Gemini API (free tier):** the model in use is `gemini-3.1-flash-lite` (stable). Flash-Lite is the cheapest, highest-quota Flash-family tier — check the [current quotas page](https://ai.google.dev/gemini-api/docs/rate-limits) for live numbers. Historically far above real usage at ~3 calls per supplier reply.
 
 ## Tuning Workflow
 
@@ -84,7 +84,7 @@ Tuning is done in a dedicated Claude sub-chat off the main "AH Estimating" proje
 - Three tasks: `classify`, `extractAmount`, `summarizeFilename`
 - Request/response contract (see Endpoint Contract above)
 - The six classification values (Quote / Question / Suspicious / Out-of-Office / Decline / Unrelated)
-- Gemini model (`gemini-2.5-flash` — only changed with explicit approval)
+- Gemini model (`gemini-3.1-flash-lite` — only changed with explicit approval)
 
 Tuning is about the *content* of the prompts inside the three task functions, not the Worker's shape.
 
