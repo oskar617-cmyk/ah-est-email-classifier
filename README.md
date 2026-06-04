@@ -9,8 +9,16 @@ A Cloudflare Worker that proxies Google Gemini for the **AH Estimating** PWA's e
 ## Tech Stack
 
 - Cloudflare Workers (free tier — 100,000 requests/day)
-- Google Gemini API (`gemini-3.1-flash-lite`)
+- Google Gemini API (`gemini-3-flash`)
 - Single-file `worker.js`, no build step, no npm
+
+## Versioning
+
+This Worker tracks a single `VERSION` constant at the top of `worker.js` (e.g. `v0.04`). It's bumped on every release and exposed as the `X-Worker-Version` response header so the live version can be verified post-deploy without reading logs.
+
+To verify: hit any response and check `X-Worker-Version` in the Network tab. Or run `fetch('https://ah-estimating-classifier.oskar617.workers.dev', { method: 'OPTIONS' }).then(r => console.log(r.headers.get('X-Worker-Version')))` in any browser console.
+
+History tracked as a comment block in `worker.js` next to the `VERSION` constant — bump and append on every release.
 
 ## Endpoint Contract
 
@@ -62,7 +70,7 @@ README.md          This file
 ## Free Tier Limits
 
 - **Cloudflare Workers:** 100,000 requests/day, 10ms CPU per request. Wait time on `fetch` to Gemini doesn't count as CPU, so we fit comfortably.
-- **Gemini API (free tier):** the model in use is `gemini-3.1-flash-lite` (stable). Flash-Lite is the cheapest, highest-quota Flash-family tier — check the [current quotas page](https://ai.google.dev/gemini-api/docs/rate-limits) for live numbers. Historically far above real usage at ~3 calls per supplier reply.
+- **Gemini API (free tier):** the model in use is `gemini-3-flash` (stable, Google's recommended default Flash model). Free tier runs at roughly 10 RPM, 250,000 TPM, 1,500 requests/day — far above real usage at ~3 calls per supplier reply. Check the [current quotas page](https://ai.google.dev/gemini-api/docs/rate-limits) for live numbers.
 
 ## Tuning Workflow
 
@@ -84,7 +92,7 @@ Tuning is done in a dedicated Claude sub-chat off the main "AH Estimating" proje
 - Three tasks: `classify`, `extractAmount`, `summarizeFilename`
 - Request/response contract (see Endpoint Contract above)
 - The six classification values (Quote / Question / Suspicious / Out-of-Office / Decline / Unrelated)
-- Gemini model (`gemini-3.1-flash-lite` — only changed with explicit approval)
+- Gemini model (`gemini-3-flash` — only changed with explicit approval)
 
 Tuning is about the *content* of the prompts inside the three task functions, not the Worker's shape.
 

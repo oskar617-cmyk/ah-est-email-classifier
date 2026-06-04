@@ -14,6 +14,15 @@
 // Response body: { result }            on success
 //                { error: "..." }      on failure
 
+// Bump on every release. Mirrored as X-Worker-Version header on every
+// response so the live version can be verified post-deploy without
+// reading logs. Format: v[MAJOR].[MINOR][.PATCH]. History:
+//   v0.01 — initial worker
+//   v0.02 — README updates (tuning workflow + doc-dropper warning)
+//   v0.03 — switch to gemini-3.1-flash-lite
+//   v0.04 — switch to gemini-3-flash (current)
+const VERSION = 'v0.04';
+
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin') || '';
@@ -25,7 +34,8 @@ export default {
       'Access-Control-Allow-Origin': corsOrigin || '*',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
-      'Access-Control-Max-Age': '600'
+      'Access-Control-Max-Age': '600',
+      'X-Worker-Version': VERSION
     };
 
     // Preflight
@@ -151,14 +161,14 @@ ${safe(p.attachmentText)}`;
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
 
 async function callGemini(apiKey, prompt) {
-  // Model: gemini-3.1-flash-lite (stable, Flash-Lite tier). Newest stable
-  // Flash-family model as of 2026-05. Optimised for high-volume, low-latency
-  // classification — well-suited to this Worker's three tasks. If quality
-  // ever drops on extractAmount or summarizeFilename, the upgrade path is
-  // gemini-3-flash-preview (more reasoning, but preview-only with
-  // deprecation risk).
+  // Model: gemini-3-flash (stable, full Flash tier). Google's recommended
+  // default Flash model — stronger reasoning than 3.1-flash-lite, same
+  // free tier eligibility, with 1,500 RPD (up from 1,000 on lite). Picked
+  // for the extractAmount task which benefits from more reasoning when
+  // parsing messy PDF text. Classification and filename tasks unchanged
+  // in quality.
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
