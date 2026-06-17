@@ -20,8 +20,18 @@
 //   v0.01 — initial worker
 //   v0.02 — README updates (tuning workflow + doc-dropper warning)
 //   v0.03 — switch to gemini-3.1-flash-lite
-//   v0.04 — switch to gemini-3-flash (current)
-const VERSION = 'v0.04';
+//   v0.04 — switch to gemini-3-flash
+//   v0.05 — add runMethod task (Vanta Mode-B recipe runner) (current)
+const VERSION = 'v0.05';
+
+import { FIXTURES } from './fixtures.js';
+
+// How many of a recipe's worked examples to include as few-shot context.
+const MAX_EXAMPLES = 3;
+// Per-isolate recipe cache (methodId -> pack). Vanta locks the version
+// server-side; a 409 on fetch means re-authorization is needed. Examples can
+// auto-update without bumping the version, so a per-isolate cache is fine.
+const recipeCache = new Map();
 
 export default {
   async fetch(request, env, ctx) {
@@ -59,11 +69,20 @@ export default {
       if (task === 'classify')               result = await doClassify(env.GEMINI_API_KEY, payload);
       else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
+      else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
       return jsonResponse({ result }, 200, corsHeaders);
     } catch (err) {
-      console.error('Gemini call failed:', err && err.stack || err);
-      return jsonResponse({ error: (err && err.message) || 'Classifier error' }, 500, corsHeaders);
+      // Propagate a Vanta 409 (method changed since this app was authorized)
+      // so the PWA can prompt the Owner to re-authorize.
+      if (err && err.status === 409) {
+        return jsonResponse({ error: 'needs-reauth' }, 409, corsHeaders);
+      }
+      if (err && err.status === 400) {
+        return jsonResponse({ error: (err.message) || 'Bad request' }, 400, corsHeaders);
+      }
+      console.error('Worker task failed:', err && err.stack || err);
+      return jsonResponse({ error: (err && err.message) || 'Worker error' }, 500, corsHeaders);
     }
   }
 };
@@ -156,6 +175,129 @@ ${safe(p.attachmentText)}`;
   summary = String(summary).replace(/[^A-Za-z0-9]/g, '').slice(0, 30) || 'Document';
   return { summary };
 }
+
+// ---------- runMethod: Vanta Mode-B recipe runner ----------
+//
+// Fetch a method's recipe pack from Vanta (or a local fixture when no token is
+// configured), build a few-shot prompt, run it on Gemini, then validate the
+// output against the method's JSON-Schema. One retry on validation failure,
+// then degrade to { outputValid:false } so the caller surfaces it for review
+// instead of acting on a bad shape.
+async function doRunMethod(env, p) {
+  const methodId = p && p.methodId;
+  const input = (p && p.input) || {};
+  if (!methodId) { const e = new Error('methodId required'); e.status = 400; throw e; }
+
+  const pack = await getRecipe(methodId, env);   // throws { status:409 } on reauth
+  const prompt = buildMethodPrompt(pack, input);
+
+  let output = parseJson(await callGemini(env.GEMINI_API_KEY, prompt));
+  let errs = validateOutput(output, pack.outputSchema);
+  if (errs.length) {
+    const retry = prompt +
+      `\n\nYour previous answer failed validation: ${errs.slice(0, 5).join('; ')}. ` +
+      `Return CORRECTED strict JSON only that matches the schema.`;
+    output = parseJson(await callGemini(env.GEMINI_API_KEY, retry));
+    errs = validateOutput(output, pack.outputSchema);
+  }
+
+  return {
+    output: output != null ? output : null,
+    outputValid: errs.length === 0,
+    version: pack.version || null,
+    contentHash: pack.contentHash || null
+  };
+}
+
+// Fetch + cache a recipe pack. Live mode (env.VANTA_BASE + VANTA_APP_TOKEN):
+// plain GET with the bearer token, no hash in the request. A 409 means the
+// method changed since this app was authorized -> bubble up for re-auth. No
+// token configured: fall back to the bundled fixture so the runner is testable
+// offline.
+async function getRecipe(methodId, env) {
+  if (recipeCache.has(methodId)) return recipeCache.get(methodId);
+  let pack;
+  if (env && env.VANTA_BASE && env.VANTA_APP_TOKEN) {
+    const url = `${env.VANTA_BASE.replace(/\/$/, '')}/v1/library/methods/${encodeURIComponent(methodId)}/recipe`;
+    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${env.VANTA_APP_TOKEN}` } });
+    if (res.status === 409) { const e = new Error('Method changed since authorization'); e.status = 409; throw e; }
+    if (!res.ok) { const t = await res.text().catch(() => ''); const e = new Error(`Recipe fetch ${res.status}: ${t.slice(0, 200)}`); e.status = res.status; throw e; }
+    pack = await res.json();
+  } else {
+    pack = FIXTURES[methodId];
+    if (!pack) { const e = new Error(`No fixture recipe for ${methodId}`); e.status = 404; throw e; }
+  }
+  recipeCache.set(methodId, pack);
+  return pack;
+}
+
+// Assemble recipe + output schema + synthetic few-shot examples + this input.
+function buildMethodPrompt(pack, input) {
+  const examples = (pack.examples || []).slice(0, MAX_EXAMPLES).map((ex, i) =>
+    `Example ${i + 1}:\nINPUT:\n${JSON.stringify(ex.input)}\nOUTPUT:\n${JSON.stringify(ex.output)}`
+  ).join('\n\n');
+  return `${pack.recipe || ''}
+
+Respond with STRICT JSON only — no prose, no markdown fences — conforming to this JSON Schema (draft-07):
+${JSON.stringify(pack.outputSchema || {})}
+${examples ? `\nWorked examples:\n${examples}\n` : ''}
+Now produce the output JSON for this INPUT:
+${JSON.stringify(input)}`;
+}
+
+// Minimal JSON-Schema (draft-07 subset) validator: type, enum, required,
+// properties, items. Unknown keywords pass (Ajv strict:false parity). Returns
+// an array of error strings (empty = valid).
+function validateOutput(data, schema, path = '') {
+  const errs = [];
+  if (!schema || typeof schema !== 'object') return errs;
+  const where = path || 'root';
+
+  if (schema.type) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    if (!types.some(t => matchType(data, t))) {
+      errs.push(`${where}: expected ${types.join('|')}, got ${jsType(data)}`);
+      return errs; // wrong type — deeper checks would be noise
+    }
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some(e => e === data)) {
+    errs.push(`${where}: value ${JSON.stringify(data)} not in enum`);
+  }
+  if (schema.properties && data && typeof data === 'object' && !Array.isArray(data)) {
+    for (const [k, sub] of Object.entries(schema.properties)) {
+      if (k in data) errs.push(...validateOutput(data[k], sub, `${path}.${k}`));
+    }
+  }
+  if (Array.isArray(schema.required)) {
+    for (const k of schema.required) {
+      if (!data || typeof data !== 'object' || !(k in data)) errs.push(`${where}: missing required '${k}'`);
+    }
+  }
+  if (schema.items && Array.isArray(data)) {
+    data.forEach((it, i) => errs.push(...validateOutput(it, schema.items, `${path}[${i}]`)));
+  }
+  return errs;
+}
+
+function matchType(d, t) {
+  switch (t) {
+    case 'object':  return d != null && typeof d === 'object' && !Array.isArray(d);
+    case 'array':   return Array.isArray(d);
+    case 'string':  return typeof d === 'string';
+    case 'number':  return typeof d === 'number' && isFinite(d);
+    case 'integer': return typeof d === 'number' && Number.isInteger(d);
+    case 'boolean': return typeof d === 'boolean';
+    case 'null':    return d === null;
+    default:        return true;
+  }
+}
+
+function jsType(d) {
+  return Array.isArray(d) ? 'array' : (d === null ? 'null' : typeof d);
+}
+
+// Exported for offline unit tests (node). Cloudflare only uses `export default`.
+export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
