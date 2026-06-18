@@ -21,8 +21,10 @@
 //   v0.02 — README updates (tuning workflow + doc-dropper warning)
 //   v0.03 — switch to gemini-3.1-flash-lite
 //   v0.04 — switch to gemini-3-flash
-//   v0.05 — add runMethod task (Vanta Mode-B recipe runner) (current)
-const VERSION = 'v0.05';
+//   v0.05 — add runMethod task (Vanta Mode-B recipe runner)
+//   v0.06 — gemini-3-flash 404s on this key; switch to gemini-2.5-flash
+//           (fixes classify/extractAmount too) (current)
+const VERSION = 'v0.06';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -303,14 +305,12 @@ export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod };
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
 
 async function callGemini(apiKey, prompt) {
-  // Model: gemini-3-flash (stable, full Flash tier). Google's recommended
-  // default Flash model — stronger reasoning than 3.1-flash-lite, same
-  // free tier eligibility, with 1,500 RPD (up from 1,000 on lite). Picked
-  // for the extractAmount task which benefits from more reasoning when
-  // parsing messy PDF text. Classification and filename tasks unchanged
-  // in quality.
+  // Model: gemini-2.5-flash — stable, GA, broadly available on our key
+  // (gemini-3-flash 404s: "not found for API version v1beta"). Good reasoning
+  // for the extractAmount + runMethod analysis tasks; JSON response mode.
+  // Bump deliberately to a newer flash once confirmed available on the key.
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash:generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
