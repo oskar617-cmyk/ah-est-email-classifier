@@ -23,17 +23,21 @@
 //   v0.04 — switch to gemini-3-flash
 //   v0.05 — add runMethod task (Vanta Mode-B recipe runner)
 //   v0.06 — gemini-3-flash 404s on this key; switch to gemini-2.5-flash
-//           (fixes classify/extractAmount too) (current)
-const VERSION = 'v0.06';
+//           (fixes classify/extractAmount too)
+//   v0.07 — recipe cache: 1-day TTL + serve-stale-on-error (current)
+const VERSION = 'v0.07';
 
 import { FIXTURES } from './fixtures.js';
 
 // How many of a recipe's worked examples to include as few-shot context.
 const MAX_EXAMPLES = 3;
-// Per-isolate recipe cache (methodId -> pack). Vanta locks the version
-// server-side; a 409 on fetch means re-authorization is needed. Examples can
-// auto-update without bumping the version, so a per-isolate cache is fine.
+// Per-isolate recipe cache (methodId -> { pack, at }). Vanta is pull-based (it
+// can't notify us when a method changes), so we re-fetch a recipe when the
+// cached copy is older than RECIPE_TTL_MS — picking up edited recipes and
+// auto-updated examples within a day. A 409 on fetch means re-authorization is
+// needed; other fetch errors fall back to the stale cached copy.
 const recipeCache = new Map();
+const RECIPE_TTL_MS = 24 * 60 * 60 * 1000;   // re-fetch a cached recipe once a day
 
 export default {
   async fetch(request, env, ctx) {
@@ -217,20 +221,28 @@ async function doRunMethod(env, p) {
 // token configured: fall back to the bundled fixture so the runner is testable
 // offline.
 async function getRecipe(methodId, env) {
-  if (recipeCache.has(methodId)) return recipeCache.get(methodId);
-  let pack;
-  if (env && env.VANTA_BASE && env.VANTA_APP_TOKEN) {
-    const url = `${env.VANTA_BASE.replace(/\/$/, '')}/v1/library/methods/${encodeURIComponent(methodId)}/recipe`;
-    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${env.VANTA_APP_TOKEN}` } });
-    if (res.status === 409) { const e = new Error('Method changed since authorization'); e.status = 409; throw e; }
-    if (!res.ok) { const t = await res.text().catch(() => ''); const e = new Error(`Recipe fetch ${res.status}: ${t.slice(0, 200)}`); e.status = res.status; throw e; }
-    pack = await res.json();
-  } else {
-    pack = FIXTURES[methodId];
-    if (!pack) { const e = new Error(`No fixture recipe for ${methodId}`); e.status = 404; throw e; }
+  const hit = recipeCache.get(methodId);
+  if (hit && (Date.now() - hit.at) < RECIPE_TTL_MS) return hit.pack;
+  try {
+    let pack;
+    if (env && env.VANTA_BASE && env.VANTA_APP_TOKEN) {
+      const url = `${env.VANTA_BASE.replace(/\/$/, '')}/v1/library/methods/${encodeURIComponent(methodId)}/recipe`;
+      const res = await fetch(url, { headers: { 'Authorization': `Bearer ${env.VANTA_APP_TOKEN}` } });
+      if (res.status === 409) { const e = new Error('Method changed since authorization'); e.status = 409; throw e; }
+      if (!res.ok) { const t = await res.text().catch(() => ''); const e = new Error(`Recipe fetch ${res.status}: ${t.slice(0, 200)}`); e.status = res.status; throw e; }
+      pack = await res.json();
+    } else {
+      pack = FIXTURES[methodId];
+      if (!pack) { const e = new Error(`No fixture recipe for ${methodId}`); e.status = 404; throw e; }
+    }
+    recipeCache.set(methodId, { pack, at: Date.now() });
+    return pack;
+  } catch (e) {
+    // Re-auth must surface; otherwise prefer a stale cached recipe over failing.
+    if (e.status === 409) throw e;
+    if (hit) { console.warn('recipe fetch failed, serving stale copy:', e.message); return hit.pack; }
+    throw e;
   }
-  recipeCache.set(methodId, pack);
-  return pack;
 }
 
 // Assemble recipe + output schema + synthetic few-shot examples + this input.
