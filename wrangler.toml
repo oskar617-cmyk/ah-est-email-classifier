@@ -5,10 +5,15 @@
 # duplicate Worker on next deploy and the PWA's CONFIG.classifierUrl would
 # stop resolving.
 #
-# Secrets and runtime variables are NOT defined here:
-#   - GEMINI_API_KEY  -> Cloudflare dashboard -> Settings -> Variables and Secrets (Type: Secret)
-#   - CORS_ORIGINS    -> Cloudflare dashboard -> Settings -> Variables and Secrets (Type: Text)
-#                        currently set to: https://oskar617-cmyk.github.io
+# SECRETS (never in this file — set via `wrangler secret put` / dashboard):
+#   - GEMINI_API_KEY   -> Gemini API key
+#   - VANTA_APP_TOKEN  -> Vanta app token (fetchRecipe scope) for the Mode-B
+#                         method runner. When unset, runMethod falls back to the
+#                         bundled fixtures (offline). Stored locally at
+#                         ~/.claude/secrets/ah-est-vanta-app-token.txt.
+#
+# Non-secret runtime variables ARE code-managed below in [vars] (was: dashboard
+# Text vars). On deploy, [vars] is authoritative — keep CORS_ORIGINS complete.
 #
 # `compatibility_date` is the snapshot of the Workers runtime to use. Pin
 # rather than auto-rolling so a Cloudflare runtime change can never silently
@@ -17,3 +22,11 @@
 name = "ah-estimating-classifier"
 main = "worker.js"
 compatibility_date = "2025-09-01"
+
+[vars]
+# Vanta base URL (Tailscale Funnel, public HTTPS). The Worker fetches method
+# recipes from here with the VANTA_APP_TOKEN secret.
+VANTA_BASE = "https://kaa-nuc.tailc0993f.ts.net"
+# Origins allowed to call this Worker. Live PWA is on pages.dev; github.io is
+# the backup host. Add localhost origins here if testing the runner locally.
+CORS_ORIGINS = "https://ah-estimating.pages.dev,https://oskar617-cmyk.github.io"
