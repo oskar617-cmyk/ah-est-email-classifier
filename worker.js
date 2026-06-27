@@ -24,8 +24,9 @@
 //   v0.05 — add runMethod task (Vanta Mode-B recipe runner)
 //   v0.06 — gemini-3-flash 404s on this key; switch to gemini-2.5-flash
 //           (fixes classify/extractAmount too)
-//   v0.07 — recipe cache: 1-day TTL + serve-stale-on-error (current)
-const VERSION = 'v0.07';
+//   v0.07 — recipe cache: 1-day TTL + serve-stale-on-error
+//   v0.08 — add sendCorrection task (Vanta flywheel feedback forwarder) (current)
+const VERSION = 'v0.08';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -76,6 +77,7 @@ export default {
       else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
+      else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
       return jsonResponse({ result }, 200, corsHeaders);
     } catch (err) {
@@ -213,6 +215,41 @@ async function doRunMethod(env, p) {
     version: pack.version || null,
     contentHash: pack.contentHash || null
   };
+}
+
+// ---------- sendCorrection: Vanta flywheel feedback forwarder ----------
+//
+// Forward a human correction of an AI output to Vanta so the method can learn
+// from it. The browser never holds the token, so it POSTs the assembled
+// feedback object here and we relay it to Vanta with the app token. Ingest-only
+// on Vanta's side (de-identify + Owner-approve happen there). Payload:
+//   { methodId, feedback: { version, input, aiOutput, correctedOutput,
+//                           reaction, occurredAt, note? } }
+// Soft-fails 403 (token lacks "Send corrections" permission) and 404 (endpoint
+// not live yet) as { ok:false, status, error } so the PWA logs but never breaks.
+async function doSendCorrection(env, p) {
+  const methodId = p && p.methodId;
+  const feedback = p && p.feedback;
+  if (!methodId) { const e = new Error('methodId required'); e.status = 400; throw e; }
+  if (!feedback || typeof feedback !== 'object') { const e = new Error('feedback object required'); e.status = 400; throw e; }
+  if (!feedback.version) { const e = new Error('feedback.version required'); e.status = 400; throw e; }
+  if (!(env && env.VANTA_BASE && env.VANTA_APP_TOKEN)) {
+    return { ok: false, skipped: 'vanta-not-configured' };
+  }
+
+  const url = `${env.VANTA_BASE.replace(/\/$/, '')}/v1/library/methods/${encodeURIComponent(methodId)}/feedback`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${env.VANTA_APP_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(feedback)
+  });
+  if (res.status === 409) { const e = new Error('Method changed since authorization'); e.status = 409; throw e; }
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* leave null */ }
+  if (!res.ok) {
+    return { ok: false, status: res.status, error: (data && data.error) || `feedback ${res.status}` };
+  }
+  return { ok: true, id: (data && data.id) || null, status: res.status };
 }
 
 // Fetch + cache a recipe pack. Live mode (env.VANTA_BASE + VANTA_APP_TOKEN):
