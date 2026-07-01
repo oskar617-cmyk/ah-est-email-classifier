@@ -27,8 +27,21 @@
 //   v0.07 — recipe cache: 1-day TTL + serve-stale-on-error
 //   v0.08 — add sendCorrection task (Vanta flywheel feedback forwarder)
 //   v0.09 — add visionAmount task (read the amount off a scanned PDF/image
-//           quote with Gemini vision, when there is no text layer) (current)
-const VERSION = 'v0.09';
+//           quote with Gemini vision, when there is no text layer)
+//   v0.10 — switch model to gemini-3.1-flash-lite (free tier: far higher daily
+//           quota than 2.5-flash's 250 RPD; supports vision + JSON)
+//   v0.11 — harden the vision prompt against hallucinated amounts (flash-lite
+//           invented a total for a blank image; now told to null unreadables)
+//   v0.12 — drop the trade hint from vision (it biased fabrication) + temp 0;
+//           blank images now reliably return null across the lite models (current)
+const VERSION = 'v0.12';
+
+// The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
+// is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
+// has a much larger free allowance and still does vision + strict-JSON output.
+// (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
+// gemini-3.1-flash-lite / gemini-3-flash-preview. Change here to roll back.)
+const GEMINI_MODEL = 'gemini-3.1-flash-lite';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -175,14 +188,19 @@ async function doVisionAmount(apiKey, p) {
   const fileBase64 = p && p.fileBase64;
   const mimeType = (p && p.mimeType) || 'application/pdf';
   if (!fileBase64) { const e = new Error('fileBase64 required'); e.status = 400; throw e; }
-  const prompt = `This is a supplier quote document for a building job${p && p.hint ? ` (${safe(p.hint)})` : ''}. It may be a scan or a photo. Read it and respond with STRICT JSON only:
+  // NB: do NOT feed the item/trade hint into this prompt — it biases a small
+  // model into inventing a plausible company + total when the scan is unreadable
+  // (observed: a blank image returned "$1450 from A1 Painting" when hinted
+  // "Painting"). Read only what is actually on the page.
+  const prompt = `You are shown an image/scan that should be a supplier price quote. Respond with STRICT JSON only:
 
   {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
 
 Rules:
-- amount = the single headline TOTAL the supplier is quoting — prefer the GST-inclusive grand total. A plain number only (no $, no commas).
-- Do NOT pick a line-item; pick the overall total.
-- If you genuinely cannot read a total, return null. Do not invent a number.`;
+- amount = ONLY a total price you can ACTUALLY SEE printed in the image — prefer the GST-inclusive grand total. A plain number (no $ or commas), never a line item.
+- company = ONLY a supplier name you can actually read; otherwise "".
+- If the image is blank, unreadable, not a price quote, or you cannot clearly SEE a total, set amount to null and company to "".
+- NEVER guess, estimate, calculate, or invent. A null is far better than a wrong number. Only report digits/words you can actually read on the page.`;
   const text = await callGeminiVision(apiKey, prompt, fileBase64, mimeType);
   const json = parseJson(text);
   if (!json) return { amount: null, currency: 'AUD' };
@@ -387,7 +405,7 @@ async function callGemini(apiKey, prompt) {
   // for the extractAmount + runMethod analysis tasks; JSON response mode.
   // Bump deliberately to a newer flash once confirmed available on the key.
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
@@ -414,7 +432,7 @@ async function callGemini(apiKey, prompt) {
 // inline_data so the model can READ a scan/photo that has no text layer.
 async function callGeminiVision(apiKey, prompt, base64, mimeType) {
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
@@ -424,7 +442,7 @@ async function callGeminiVision(apiKey, prompt, base64, mimeType) {
         { text: prompt },
         { inline_data: { mime_type: mimeType || 'application/pdf', data: base64 } }
       ] }],
-      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
+      generationConfig: { temperature: 0, responseMimeType: 'application/json' }
     })
   });
   if (!res.ok) {
