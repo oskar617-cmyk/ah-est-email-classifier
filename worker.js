@@ -39,8 +39,16 @@
 //   v0.14 — amount prompts (vision + extractAmount) now require the GST-INCLUSIVE
 //           grand total (was ambiguous)
 //   v0.15 — vision amount: sharper prompt (total labels + read every digit) +
-//           retry a null read with a more capable model (gemini-2.5-flash) (current)
-const VERSION = 'v0.15';
+//           retry a null read with a more capable model (gemini-2.5-flash)
+//   v0.16 — v0.15 prompt over-pushed: an example figure + "largest number"
+//           language made models invent a total for a blank image. Reverted to a
+//           label-guided but honest prompt (null unless a total is clearly seen)
+//   v0.17 — drop the 2.5-flash retry: it HALLUCINATED a total ($1045 from a blank)
+//   v0.18 — root cause was the prompt's "Total/Grand Total/..." LABEL LIST, which
+//           primed a receipt hallucination on a blank. Removed it; the simple
+//           honest prompt returns null on a blank for BOTH models (verified), so
+//           the 2.5-flash retry is restored (lifts recall, stays honest) (current)
+const VERSION = 'v0.18';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -48,9 +56,9 @@ const VERSION = 'v0.15';
 // (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
 // gemini-3.1-flash-lite / gemini-3-flash-preview. Change here to roll back.)
 const GEMINI_MODEL = 'gemini-3.1-flash-lite';
-// A more capable model, used ONLY as a retry when the lite model can't read a
-// price off a scan (better OCR/reasoning; small free quota so we don't use it
-// for the bulk, only the misses).
+// A more capable model, used ONLY to retry a scan the lite model couldn't read a
+// price off. Both use the SAME honest prompt (verified to return null on an
+// unreadable/blank image), so this lifts recall without inventing numbers.
 const GEMINI_VISION_FALLBACK = 'gemini-2.5-flash';
 
 import { FIXTURES } from './fixtures.js';
@@ -208,16 +216,15 @@ async function doVisionAmount(apiKey, p) {
   {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
 
 Rules:
-- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST). A plain number (no $ or commas), never a single line item.
-- Find it by a label: "Total", "Total incl GST", "Total (inc GST)", "Grand Total", "Amount Payable", "Balance Due", "Total Due" — or the largest dollar figure near the bottom / on the last page. Check every page.
-- Read every digit carefully — these are Australian dollars with 2 decimals (e.g. 23,240.25). Do not drop or add digits.
-- If the page shows an ex-GST subtotal and a separate GST line but no inclusive total, amount = subtotal + GST (both read off the page).
+- amount = the GST-INCLUSIVE grand total ACTUALLY PRINTED on the quote (the final amount payable including GST). A plain number (no $ or commas), never a single line item.
+- If the page only shows an ex-GST subtotal and a separate GST line, amount = subtotal + GST (both read off the page).
 - company = ONLY a supplier name you can actually read; otherwise "".
-- If the image is blank, unreadable, not a price quote (e.g. a safety document or a rate card with no single total), or you cannot clearly SEE a total, set amount to null and company to "".
-- Only report figures you can actually read on the page. NEVER invent a number. A null is far better than a wrong number.`;
+- If the image is blank, unreadable, not a price quote (a safety document, a rate card with no single total, etc.), or you cannot clearly SEE a printed total, set amount to null and company to "".
+- NEVER guess, estimate, calculate, or invent. A null is FAR better than a wrong number. Only report figures you can actually read on the page.`;
   let json = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_MODEL));
   let amount = (json && typeof json.amount === 'number') ? json.amount : null;
-  // Retry the ones the lite model couldn't read with a more capable model.
+  // Retry only the ones the lite model couldn't read, with a more capable model
+  // (same honest prompt -> it stays null on unreadable, but reads more real scans).
   if (amount == null) {
     const j2 = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_VISION_FALLBACK));
     if (j2 && typeof j2.amount === 'number') { json = j2; amount = j2.amount; }
