@@ -35,8 +35,10 @@
 //   v0.12 — drop the trade hint from vision (it biased fabrication) + temp 0;
 //           blank images now reliably return null across the lite models
 //   v0.13 — add matchBudgetItem task (AI picks the budget item for a quote when
-//           the filename didn't map) (current)
-const VERSION = 'v0.13';
+//           the filename didn't map)
+//   v0.14 — amount prompts (vision + extractAmount) now require the GST-INCLUSIVE
+//           grand total (was ambiguous) (current)
+const VERSION = 'v0.14';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -163,9 +165,9 @@ Respond with STRICT JSON only:
   {"amount":<number-or-null>,"currency":"AUD","notes":"<brief reason>"}
 
 Rules:
-- amount is a single number, the headline total the supplier is quoting (excluding GST if a separate ex-GST/inc-GST distinction is shown — prefer the inc-GST total).
+- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST) — a single number. If only an ex-GST subtotal + a separate GST line are shown, amount = subtotal + GST.
 - If no amount can be confidently extracted, return null.
-- Don't invent a number. Don't pick the lowest line item — pick the total.
+- Don't invent a number. Don't pick the lowest line item — pick the grand total.
 
 EMAIL SUBJECT: ${safe(p.subject)}
 EMAIL BODY (truncated):
@@ -200,10 +202,11 @@ async function doVisionAmount(apiKey, p) {
   {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
 
 Rules:
-- amount = ONLY a total price you can ACTUALLY SEE printed in the image — prefer the GST-inclusive grand total. A plain number (no $ or commas), never a line item.
+- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST) — usually the largest/last total on the page. A plain number (no $ or commas), never a single line item.
+- If the page shows an ex-GST subtotal and a separate GST line but no inclusive total, amount = subtotal + GST (both read off the page).
 - company = ONLY a supplier name you can actually read; otherwise "".
 - If the image is blank, unreadable, not a price quote, or you cannot clearly SEE a total, set amount to null and company to "".
-- NEVER guess, estimate, calculate, or invent. A null is far better than a wrong number. Only report digits/words you can actually read on the page.`;
+- Only report figures you can actually read on the page. NEVER invent a number. A null is far better than a wrong number.`;
   const text = await callGeminiVision(apiKey, prompt, fileBase64, mimeType);
   const json = parseJson(text);
   if (!json) return { amount: null, currency: 'AUD' };
