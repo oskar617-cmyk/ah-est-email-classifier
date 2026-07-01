@@ -52,8 +52,12 @@
 //           quota, no hallucination). Recall lever is now image quality, not model
 //   v0.20 — visionAmount accepts an images[] array (multiple page PNGs), so the
 //           app can send HIGH-DPI page renders of a scanned PDF instead of the raw
-//           PDF (sharper digits -> better reads, still honest) (current)
-const VERSION = 'v0.20';
+//           PDF (sharper digits -> better reads, still honest)
+//   v0.21 — add visionOcr task (transcribe an image/scan to text so it runs the
+//           SAME text amount/analysis path). Amount readers now report gstIncluded
+//           (true/false/null) and NO LONGER add GST themselves — the app grosses up
+//           an ex-GST total by the 10% default, uniformly across readers (current)
+const VERSION = 'v0.21';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -110,6 +114,7 @@ export default {
       if (task === 'classify')               result = await doClassify(env.GEMINI_API_KEY, payload);
       else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
       else if (task === 'visionAmount')      result = await doVisionAmount(env.GEMINI_API_KEY, payload);
+      else if (task === 'visionOcr')         result = await doVisionOcr(env.GEMINI_API_KEY, payload);
       else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
@@ -177,12 +182,12 @@ async function doExtractAmount(apiKey, p) {
   const prompt = `Extract the total quoted amount (in AUD) from this supplier email and any attached PDF text.
 Respond with STRICT JSON only:
 
-  {"amount":<number-or-null>,"currency":"AUD","notes":"<brief reason>"}
+  {"amount":<number-or-null>,"gstIncluded":<true|false|null>,"currency":"AUD","notes":"<brief reason>"}
 
 Rules:
-- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST) — a single number. If only an ex-GST subtotal + a separate GST line are shown, amount = subtotal + GST.
-- If no amount can be confidently extracted, return null.
-- Don't invent a number. Don't pick the lowest line item — pick the grand total.
+- amount = the final grand total the supplier is quoting (the total payable / grand total line) — a single number. Never the lowest line item.
+- gstIncluded = true if that total already includes GST; false if the quote states the figure EXCLUDES GST (e.g. "ex GST", "+ GST", "plus GST", "excluding GST"); null if not stated. Do NOT add or remove GST yourself — report the printed figure and whether it includes GST.
+- If no total can be confidently read, amount = null. Don't invent a number.
 
 EMAIL SUBJECT: ${safe(p.subject)}
 EMAIL BODY (truncated):
@@ -193,9 +198,10 @@ ${safe(p.attachmentText)}`;
 
   const text = await callGemini(apiKey, prompt);
   const json = parseJson(text);
-  if (!json) return { amount: null, currency: 'AUD' };
+  if (!json) return { amount: null, currency: 'AUD', gstIncluded: null };
   return {
     amount: typeof json.amount === 'number' ? json.amount : null,
+    gstIncluded: typeof json.gstIncluded === 'boolean' ? json.gstIncluded : null,
     currency: json.currency || 'AUD',
     notes: json.notes || ''
   };
@@ -205,16 +211,10 @@ ${safe(p.attachmentText)}`;
 // or an image (jpg/png). We send the file itself to Gemini vision (multimodal),
 // since there is no text to extract. payload: { fileBase64, mimeType, hint }.
 async function doVisionAmount(apiKey, p) {
-  p = p || {};
   // Accept EITHER a single file (fileBase64 + mimeType) OR an array of page
   // images (images:[{base64, mimeType}]). The app renders scanned PDFs to
   // high-DPI PNGs and sends them as images, so the model reads sharper digits.
-  let media = [];
-  if (Array.isArray(p.images) && p.images.length) {
-    media = p.images.filter(im => im && im.base64).map(im => ({ data: im.base64, mimeType: im.mimeType || 'image/png' }));
-  } else if (p.fileBase64) {
-    media = [{ data: p.fileBase64, mimeType: p.mimeType || 'application/pdf' }];
-  }
+  const media = mediaFromPayload(p);
   if (!media.length) { const e = new Error('fileBase64 or images required'); e.status = 400; throw e; }
   // NB: do NOT feed the item/trade hint into this prompt — it biases a small
   // model into inventing a plausible company + total when the scan is unreadable
@@ -222,20 +222,42 @@ async function doVisionAmount(apiKey, p) {
   // "Painting"). Read only what is actually on the page.
   const prompt = `You are shown an image/scan that should be a supplier price quote. Respond with STRICT JSON only:
 
-  {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
+  {"amount":<number-or-null>,"gstIncluded":<true|false|null>,"currency":"AUD","company":"<supplier name or empty>"}
 
 Rules:
-- amount = the GST-INCLUSIVE grand total ACTUALLY PRINTED on the quote (the final amount payable including GST). A plain number (no $ or commas), never a single line item.
-- If the page only shows an ex-GST subtotal and a separate GST line, amount = subtotal + GST (both read off the page).
+- amount = the final grand total figure ACTUALLY PRINTED on the quote (the total payable / grand total), as a single plain number (no $ or commas). Never a single line item, never the smallest number.
+- gstIncluded = true if that printed total already includes GST; false if the quote states the figure EXCLUDES GST (e.g. "ex GST", "+ GST", "plus GST", "excluding GST"); null if it is not stated. Do NOT add or remove GST yourself — just report the printed figure and whether it includes GST.
 - company = ONLY a supplier name you can actually read; otherwise "".
 - If the image is blank, unreadable, not a price quote (a safety document, a rate card with no single total, etc.), or you cannot clearly SEE a printed total, set amount to null and company to "".
 - NEVER guess, estimate, calculate, or invent. A null is FAR better than a wrong number. Only report figures you can actually read on the page.`;
   const json = parseJson(await callGeminiVision(apiKey, prompt, media, GEMINI_MODEL));
   return {
     amount: (json && typeof json.amount === 'number') ? json.amount : null,
+    gstIncluded: (json && typeof json.gstIncluded === 'boolean') ? json.gstIncluded : null,
     currency: (json && json.currency) || 'AUD',
     company: (json && json.company) || ''
   };
+}
+
+// Transcribe ALL readable text off an image/scan (OCR), so a photographed or
+// scanned quote can go through the SAME text amount/analysis path (incl. GST
+// handling) as a text PDF. Accepts images:[{base64,mimeType}] or fileBase64.
+async function doVisionOcr(apiKey, p) {
+  const media = mediaFromPayload(p);
+  if (!media.length) { const e = new Error('fileBase64 or images required'); e.status = 400; throw e; }
+  const prompt = `Transcribe ALL the text you can read in this image/scan, VERBATIM. Preserve line breaks and every number exactly as shown, including dollar amounts and labels like "Total", "Subtotal", "GST", "incl GST", "ex GST", "+ GST". Do not summarise, correct, translate, or add anything. If there is no readable text, return an empty string. Respond with STRICT JSON only: {"text":"<the transcribed text>"}`;
+  const raw = await callGeminiVision(apiKey, prompt, media, GEMINI_MODEL);
+  const json = parseJson(raw);
+  return { text: (json && typeof json.text === 'string') ? json.text : (typeof raw === 'string' ? raw : '') };
+}
+
+// Build Gemini media parts from a vision payload: an images[] array (page
+// renders) or a single fileBase64. Shared by doVisionAmount + doVisionOcr.
+function mediaFromPayload(p) {
+  p = p || {};
+  if (Array.isArray(p.images) && p.images.length) return p.images.filter(im => im && im.base64).map(im => ({ data: im.base64, mimeType: im.mimeType || 'image/png' }));
+  if (p.fileBase64) return [{ data: p.fileBase64, mimeType: p.mimeType || 'application/pdf' }];
+  return [];
 }
 
 // Match a quote to ONE of our budget line items (Scan Quote Folder, when the
