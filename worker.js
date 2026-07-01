@@ -49,8 +49,11 @@
 //           honest prompt returns null on a blank for BOTH models (verified)
 //   v0.19 — drop the 2.5-flash retry for good: its 250 req/day free tier 429s
 //           almost immediately under bulk. Single honest 3.1-flash-lite (big free
-//           quota, no hallucination). Recall lever is now image quality, not model (current)
-const VERSION = 'v0.19';
+//           quota, no hallucination). Recall lever is now image quality, not model
+//   v0.20 — visionAmount accepts an images[] array (multiple page PNGs), so the
+//           app can send HIGH-DPI page renders of a scanned PDF instead of the raw
+//           PDF (sharper digits -> better reads, still honest) (current)
+const VERSION = 'v0.20';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -202,9 +205,17 @@ ${safe(p.attachmentText)}`;
 // or an image (jpg/png). We send the file itself to Gemini vision (multimodal),
 // since there is no text to extract. payload: { fileBase64, mimeType, hint }.
 async function doVisionAmount(apiKey, p) {
-  const fileBase64 = p && p.fileBase64;
-  const mimeType = (p && p.mimeType) || 'application/pdf';
-  if (!fileBase64) { const e = new Error('fileBase64 required'); e.status = 400; throw e; }
+  p = p || {};
+  // Accept EITHER a single file (fileBase64 + mimeType) OR an array of page
+  // images (images:[{base64, mimeType}]). The app renders scanned PDFs to
+  // high-DPI PNGs and sends them as images, so the model reads sharper digits.
+  let media = [];
+  if (Array.isArray(p.images) && p.images.length) {
+    media = p.images.filter(im => im && im.base64).map(im => ({ data: im.base64, mimeType: im.mimeType || 'image/png' }));
+  } else if (p.fileBase64) {
+    media = [{ data: p.fileBase64, mimeType: p.mimeType || 'application/pdf' }];
+  }
+  if (!media.length) { const e = new Error('fileBase64 or images required'); e.status = 400; throw e; }
   // NB: do NOT feed the item/trade hint into this prompt — it biases a small
   // model into inventing a plausible company + total when the scan is unreadable
   // (observed: a blank image returned "$1450 from A1 Painting" when hinted
@@ -219,7 +230,7 @@ Rules:
 - company = ONLY a supplier name you can actually read; otherwise "".
 - If the image is blank, unreadable, not a price quote (a safety document, a rate card with no single total, etc.), or you cannot clearly SEE a printed total, set amount to null and company to "".
 - NEVER guess, estimate, calculate, or invent. A null is FAR better than a wrong number. Only report figures you can actually read on the page.`;
-  const json = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_MODEL));
+  const json = parseJson(await callGeminiVision(apiKey, prompt, media, GEMINI_MODEL));
   return {
     amount: (json && typeof json.amount === 'number') ? json.amount : null,
     currency: (json && json.currency) || 'AUD',
@@ -470,7 +481,12 @@ async function callGemini(apiKey, prompt) {
 
 // Gemini vision call: same model, but the file (PDF/image) rides along as
 // inline_data so the model can READ a scan/photo that has no text layer.
-async function callGeminiVision(apiKey, prompt, base64, mimeType, model) {
+// media = array of { data (base64), mimeType }. One or more page images / a file.
+async function callGeminiVision(apiKey, prompt, media, model) {
+  const parts = [{ text: prompt }];
+  for (const m of (Array.isArray(media) ? media : [])) {
+    if (m && m.data) parts.push({ inline_data: { mime_type: m.mimeType || 'application/pdf', data: m.data } });
+  }
   const url =
     'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
@@ -478,10 +494,7 @@ async function callGeminiVision(apiKey, prompt, base64, mimeType, model) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      contents: [{ parts: [
-        { text: prompt },
-        { inline_data: { mime_type: mimeType || 'application/pdf', data: base64 } }
-      ] }],
+      contents: [{ parts }],
       generationConfig: { temperature: 0, responseMimeType: 'application/json' }
     })
   });
