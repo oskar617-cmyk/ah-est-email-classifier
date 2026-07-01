@@ -46,9 +46,11 @@
 //   v0.17 — drop the 2.5-flash retry: it HALLUCINATED a total ($1045 from a blank)
 //   v0.18 — root cause was the prompt's "Total/Grand Total/..." LABEL LIST, which
 //           primed a receipt hallucination on a blank. Removed it; the simple
-//           honest prompt returns null on a blank for BOTH models (verified), so
-//           the 2.5-flash retry is restored (lifts recall, stays honest) (current)
-const VERSION = 'v0.18';
+//           honest prompt returns null on a blank for BOTH models (verified)
+//   v0.19 — drop the 2.5-flash retry for good: its 250 req/day free tier 429s
+//           almost immediately under bulk. Single honest 3.1-flash-lite (big free
+//           quota, no hallucination). Recall lever is now image quality, not model (current)
+const VERSION = 'v0.19';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -56,10 +58,6 @@ const VERSION = 'v0.18';
 // (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
 // gemini-3.1-flash-lite / gemini-3-flash-preview. Change here to roll back.)
 const GEMINI_MODEL = 'gemini-3.1-flash-lite';
-// A more capable model, used ONLY to retry a scan the lite model couldn't read a
-// price off. Both use the SAME honest prompt (verified to return null on an
-// unreadable/blank image), so this lifts recall without inventing numbers.
-const GEMINI_VISION_FALLBACK = 'gemini-2.5-flash';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -221,15 +219,12 @@ Rules:
 - company = ONLY a supplier name you can actually read; otherwise "".
 - If the image is blank, unreadable, not a price quote (a safety document, a rate card with no single total, etc.), or you cannot clearly SEE a printed total, set amount to null and company to "".
 - NEVER guess, estimate, calculate, or invent. A null is FAR better than a wrong number. Only report figures you can actually read on the page.`;
-  let json = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_MODEL));
-  let amount = (json && typeof json.amount === 'number') ? json.amount : null;
-  // Retry only the ones the lite model couldn't read, with a more capable model
-  // (same honest prompt -> it stays null on unreadable, but reads more real scans).
-  if (amount == null) {
-    const j2 = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_VISION_FALLBACK));
-    if (j2 && typeof j2.amount === 'number') { json = j2; amount = j2.amount; }
-  }
-  return { amount, currency: (json && json.currency) || 'AUD', company: (json && json.company) || '' };
+  const json = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_MODEL));
+  return {
+    amount: (json && typeof json.amount === 'number') ? json.amount : null,
+    currency: (json && json.currency) || 'AUD',
+    company: (json && json.company) || ''
+  };
 }
 
 // Match a quote to ONE of our budget line items (Scan Quote Folder, when the
