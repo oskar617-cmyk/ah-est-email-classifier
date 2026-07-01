@@ -25,8 +25,10 @@
 //   v0.06 — gemini-3-flash 404s on this key; switch to gemini-2.5-flash
 //           (fixes classify/extractAmount too)
 //   v0.07 — recipe cache: 1-day TTL + serve-stale-on-error
-//   v0.08 — add sendCorrection task (Vanta flywheel feedback forwarder) (current)
-const VERSION = 'v0.08';
+//   v0.08 — add sendCorrection task (Vanta flywheel feedback forwarder)
+//   v0.09 — add visionAmount task (read the amount off a scanned PDF/image
+//           quote with Gemini vision, when there is no text layer) (current)
+const VERSION = 'v0.09';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -75,6 +77,7 @@ export default {
       let result;
       if (task === 'classify')               result = await doClassify(env.GEMINI_API_KEY, payload);
       else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
+      else if (task === 'visionAmount')      result = await doVisionAmount(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
@@ -162,6 +165,31 @@ ${safe(p.attachmentText)}`;
     amount: typeof json.amount === 'number' ? json.amount : null,
     currency: json.currency || 'AUD',
     notes: json.notes || ''
+  };
+}
+
+// Read the amount (and supplier) off a SCANNED quote — a PDF with no text layer,
+// or an image (jpg/png). We send the file itself to Gemini vision (multimodal),
+// since there is no text to extract. payload: { fileBase64, mimeType, hint }.
+async function doVisionAmount(apiKey, p) {
+  const fileBase64 = p && p.fileBase64;
+  const mimeType = (p && p.mimeType) || 'application/pdf';
+  if (!fileBase64) { const e = new Error('fileBase64 required'); e.status = 400; throw e; }
+  const prompt = `This is a supplier quote document for a building job${p && p.hint ? ` (${safe(p.hint)})` : ''}. It may be a scan or a photo. Read it and respond with STRICT JSON only:
+
+  {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
+
+Rules:
+- amount = the single headline TOTAL the supplier is quoting — prefer the GST-inclusive grand total. A plain number only (no $, no commas).
+- Do NOT pick a line-item; pick the overall total.
+- If you genuinely cannot read a total, return null. Do not invent a number.`;
+  const text = await callGeminiVision(apiKey, prompt, fileBase64, mimeType);
+  const json = parseJson(text);
+  if (!json) return { amount: null, currency: 'AUD' };
+  return {
+    amount: typeof json.amount === 'number' ? json.amount : null,
+    currency: json.currency || 'AUD',
+    company: json.company || ''
   };
 }
 
@@ -380,6 +408,31 @@ async function callGemini(apiKey, prompt) {
   // Standard response shape: { candidates: [{ content: { parts: [{ text: "..." }] } }] }
   const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
   return text || '';
+}
+
+// Gemini vision call: same model, but the file (PDF/image) rides along as
+// inline_data so the model can READ a scan/photo that has no text layer.
+async function callGeminiVision(apiKey, prompt, base64, mimeType) {
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent' +
+    '?key=' + encodeURIComponent(apiKey);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts: [
+        { text: prompt },
+        { inline_data: { mime_type: mimeType || 'application/pdf', data: base64 } }
+      ] }],
+      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
+    })
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Gemini vision ${res.status}: ${t.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
 // ---------- helpers ----------
