@@ -33,8 +33,10 @@
 //   v0.11 — harden the vision prompt against hallucinated amounts (flash-lite
 //           invented a total for a blank image; now told to null unreadables)
 //   v0.12 — drop the trade hint from vision (it biased fabrication) + temp 0;
-//           blank images now reliably return null across the lite models (current)
-const VERSION = 'v0.12';
+//           blank images now reliably return null across the lite models
+//   v0.13 — add matchBudgetItem task (AI picks the budget item for a quote when
+//           the filename didn't map) (current)
+const VERSION = 'v0.13';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -91,6 +93,7 @@ export default {
       if (task === 'classify')               result = await doClassify(env.GEMINI_API_KEY, payload);
       else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
       else if (task === 'visionAmount')      result = await doVisionAmount(env.GEMINI_API_KEY, payload);
+      else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
@@ -209,6 +212,30 @@ Rules:
     currency: json.currency || 'AUD',
     company: json.company || ''
   };
+}
+
+// Match a quote to ONE of our budget line items (Scan Quote Folder, when the
+// filename didn't map on its own). We pass a numbered item list and ask for the
+// index back (not free text), so nothing is invented. payload:
+//   { hint (filename item text), scope (optional), items: [{n, name}] }
+async function doMatchBudgetItem(apiKey, p) {
+  const hint = (p && p.hint) || '';
+  const scope = (p && p.scope) || '';
+  const items = (p && p.items) || [];
+  if ((!hint && !scope) || !items.length) return { n: -1 };
+  const list = items.map(it => `${it.n}. ${safe(it.name)}`).join('\n').slice(0, 9000);
+  const prompt = `A supplier quote for a residential building job is for: "${safe(hint)}"${scope ? ` (scope: ${safe(scope)})` : ''}.
+Choose the ONE budget line item below that best matches this trade / work. Respond with STRICT JSON only:
+
+  {"n": <the number of the best-matching item, or -1 if none clearly matches>}
+
+Only use a number that appears in the list. If unsure, return -1.
+
+Budget items:
+${list}`;
+  const text = await callGemini(apiKey, prompt);
+  const json = parseJson(text);
+  return { n: (json && Number.isInteger(json.n)) ? json.n : -1 };
 }
 
 async function doSummarizeFilename(apiKey, p) {
