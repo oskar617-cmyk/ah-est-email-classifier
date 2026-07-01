@@ -37,8 +37,10 @@
 //   v0.13 — add matchBudgetItem task (AI picks the budget item for a quote when
 //           the filename didn't map)
 //   v0.14 — amount prompts (vision + extractAmount) now require the GST-INCLUSIVE
-//           grand total (was ambiguous) (current)
-const VERSION = 'v0.14';
+//           grand total (was ambiguous)
+//   v0.15 — vision amount: sharper prompt (total labels + read every digit) +
+//           retry a null read with a more capable model (gemini-2.5-flash) (current)
+const VERSION = 'v0.15';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -46,6 +48,10 @@ const VERSION = 'v0.14';
 // (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
 // gemini-3.1-flash-lite / gemini-3-flash-preview. Change here to roll back.)
 const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+// A more capable model, used ONLY as a retry when the lite model can't read a
+// price off a scan (better OCR/reasoning; small free quota so we don't use it
+// for the bulk, only the misses).
+const GEMINI_VISION_FALLBACK = 'gemini-2.5-flash';
 
 import { FIXTURES } from './fixtures.js';
 
@@ -202,19 +208,21 @@ async function doVisionAmount(apiKey, p) {
   {"amount":<number-or-null>,"currency":"AUD","company":"<supplier name or empty>"}
 
 Rules:
-- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST) — usually the largest/last total on the page. A plain number (no $ or commas), never a single line item.
+- amount = the GST-INCLUSIVE grand total the supplier is quoting (the final amount payable including GST). A plain number (no $ or commas), never a single line item.
+- Find it by a label: "Total", "Total incl GST", "Total (inc GST)", "Grand Total", "Amount Payable", "Balance Due", "Total Due" — or the largest dollar figure near the bottom / on the last page. Check every page.
+- Read every digit carefully — these are Australian dollars with 2 decimals (e.g. 23,240.25). Do not drop or add digits.
 - If the page shows an ex-GST subtotal and a separate GST line but no inclusive total, amount = subtotal + GST (both read off the page).
 - company = ONLY a supplier name you can actually read; otherwise "".
-- If the image is blank, unreadable, not a price quote, or you cannot clearly SEE a total, set amount to null and company to "".
+- If the image is blank, unreadable, not a price quote (e.g. a safety document or a rate card with no single total), or you cannot clearly SEE a total, set amount to null and company to "".
 - Only report figures you can actually read on the page. NEVER invent a number. A null is far better than a wrong number.`;
-  const text = await callGeminiVision(apiKey, prompt, fileBase64, mimeType);
-  const json = parseJson(text);
-  if (!json) return { amount: null, currency: 'AUD' };
-  return {
-    amount: typeof json.amount === 'number' ? json.amount : null,
-    currency: json.currency || 'AUD',
-    company: json.company || ''
-  };
+  let json = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_MODEL));
+  let amount = (json && typeof json.amount === 'number') ? json.amount : null;
+  // Retry the ones the lite model couldn't read with a more capable model.
+  if (amount == null) {
+    const j2 = parseJson(await callGeminiVision(apiKey, prompt, fileBase64, mimeType, GEMINI_VISION_FALLBACK));
+    if (j2 && typeof j2.amount === 'number') { json = j2; amount = j2.amount; }
+  }
+  return { amount, currency: (json && json.currency) || 'AUD', company: (json && json.company) || '' };
 }
 
 // Match a quote to ONE of our budget line items (Scan Quote Folder, when the
@@ -460,9 +468,9 @@ async function callGemini(apiKey, prompt) {
 
 // Gemini vision call: same model, but the file (PDF/image) rides along as
 // inline_data so the model can READ a scan/photo that has no text layer.
-async function callGeminiVision(apiKey, prompt, base64, mimeType) {
+async function callGeminiVision(apiKey, prompt, base64, mimeType, model) {
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
