@@ -56,8 +56,11 @@
 //   v0.21 — add visionOcr task (transcribe an image/scan to text so it runs the
 //           SAME text amount/analysis path). Amount readers now report gstIncluded
 //           (true/false/null) and NO LONGER add GST themselves — the app grosses up
-//           an ex-GST total by the 10% default, uniformly across readers (current)
-const VERSION = 'v0.21';
+//           an ex-GST total by the 10% default, uniformly across readers
+//   v0.22 — lock the front door: requests must carry an allowed Origin (403
+//           otherwise — stops anonymous quota burning), CORS_ORIGINS fails closed
+//           when unset, and a per-isolate 90 req/min rate limit backs it up (current)
+const VERSION = 'v0.22';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -81,12 +84,11 @@ const RECIPE_TTL_MS = 24 * 60 * 60 * 1000;   // re-fetch a cached recipe once a 
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get('Origin') || '';
-    const allowed = parseAllowed(env.CORS_ORIGINS || '*');
-    const corsOrigin =
-      allowed.includes('*') ? '*'
-      : (allowed.includes(origin) ? origin : (allowed[0] || ''));
+    // If CORS_ORIGINS is missing, fail CLOSED (deny) — not open to '*'.
+    const allowed = parseAllowed(env.CORS_ORIGINS || '');
+    const corsOrigin = allowed.includes('*') ? '*' : (allowed.includes(origin) ? origin : (allowed[0] || ''));
     const corsHeaders = {
-      'Access-Control-Allow-Origin': corsOrigin || '*',
+      'Access-Control-Allow-Origin': corsOrigin || 'null',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Access-Control-Max-Age': '600',
@@ -99,6 +101,17 @@ export default {
     }
     if (request.method !== 'POST') {
       return jsonResponse({ error: 'POST only' }, 405, corsHeaders);
+    }
+    // ORIGIN GATE: the PWA is the only legitimate caller, and browsers always
+    // send Origin on cross-site POSTs. curl/scripts (no Origin) and foreign
+    // sites get 403 — otherwise anyone with this URL can burn the whole daily
+    // Gemini free-tier quota and stall the email pipeline. (Origin is spoofable
+    // server-side, so a light per-isolate rate limit below backs this up.)
+    if (!allowed.includes('*') && !allowed.includes(origin)) {
+      return jsonResponse({ error: 'Forbidden' }, 403, corsHeaders);
+    }
+    if (rateLimited()) {
+      return jsonResponse({ error: 'Rate limited — slow down and retry shortly' }, 429, corsHeaders);
     }
     if (!env.GEMINI_API_KEY) {
       return jsonResponse({ error: 'GEMINI_API_KEY not configured' }, 500, corsHeaders);
@@ -538,7 +551,20 @@ function jsonResponse(obj, status, extraHeaders) {
 }
 
 function parseAllowed(s) {
-  return String(s || '*').split(',').map(x => x.trim()).filter(Boolean);
+  return String(s || '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+// Light per-isolate rate limit (sliding 60s window). The app's own usage is
+// sequential (scan loop, pipeline) and stays far below this; a scripted
+// quota-burn attack trips it. Per-isolate only — a determined attacker can
+// spread across isolates, but combined with the Origin gate it raises the bar
+// enough for an internal tool.
+const RATE_LIMIT_PER_MIN = 90;
+let rlWindowStart = 0, rlCount = 0;
+function rateLimited() {
+  const now = Date.now();
+  if (now - rlWindowStart > 60000) { rlWindowStart = now; rlCount = 0; }
+  return ++rlCount > RATE_LIMIT_PER_MIN;
 }
 
 function safe(s) {
