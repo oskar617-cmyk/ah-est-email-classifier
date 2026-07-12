@@ -59,8 +59,11 @@
 //           an ex-GST total by the 10% default, uniformly across readers
 //   v0.22 — lock the front door: requests must carry an allowed Origin (403
 //           otherwise — stops anonymous quota burning), CORS_ORIGINS fails closed
-//           when unset, and a per-isolate 90 req/min rate limit backs it up (current)
-const VERSION = 'v0.22';
+//           when unset, and a per-isolate 90 req/min rate limit backs it up
+//   v0.23 — runMethod accepts images[] (page renders) as Gemini media parts, so
+//           vision methods like estimating-drawing-takeoff can read drawings;
+//           text-only methods unchanged (current)
+const VERSION = 'v0.23';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -330,14 +333,21 @@ async function doRunMethod(env, p) {
 
   const pack = await getRecipe(methodId, env);   // throws { status:409 } on reauth
   const prompt = buildMethodPrompt(pack, input);
+  // Vision-capable methods (e.g. drawing takeoff): the app can attach page
+  // images alongside the recipe input — they ride as Gemini media parts, not
+  // as recipe input (schemas stay small). Text-only methods are unchanged.
+  const media = mediaFromPayload({ images: p && p.images });
+  const ask = (q) => media.length
+    ? callGeminiVision(env.GEMINI_API_KEY, q, media, GEMINI_MODEL)
+    : callGemini(env.GEMINI_API_KEY, q);
 
-  let output = parseJson(await callGemini(env.GEMINI_API_KEY, prompt));
+  let output = parseJson(await ask(prompt));
   let errs = validateOutput(output, pack.outputSchema);
   if (errs.length) {
     const retry = prompt +
       `\n\nYour previous answer failed validation: ${errs.slice(0, 5).join('; ')}. ` +
       `Return CORRECTED strict JSON only that matches the schema.`;
-    output = parseJson(await callGemini(env.GEMINI_API_KEY, retry));
+    output = parseJson(await ask(retry));
     errs = validateOutput(output, pack.outputSchema);
   }
 
