@@ -62,8 +62,12 @@
 //           when unset, and a per-isolate 90 req/min rate limit backs it up
 //   v0.23 — runMethod accepts images[] (page renders) as Gemini media parts, so
 //           vision methods like estimating-drawing-takeoff can read drawings;
-//           text-only methods unchanged (current)
-const VERSION = 'v0.23';
+//           text-only methods unchanged
+//   v0.24 — add getRecipe task: recipe-pack passthrough for the app's Direct AI
+//           mode (Vaenyx blocks browser CORS, so the app fetches JUST the recipe
+//           here and runs the model itself on the user's own key). Same cache /
+//           409 semantics as runMethod; still behind the Origin gate (current)
+const VERSION = 'v0.24';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -134,6 +138,7 @@ export default {
       else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
+      else if (task === 'getRecipe')         result = await doGetRecipe(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
       return jsonResponse({ result }, 200, corsHeaders);
@@ -357,6 +362,17 @@ async function doRunMethod(env, p) {
     version: pack.version || null,
     contentHash: pack.contentHash || null
   };
+}
+
+// ---------- getRecipe: recipe-pack passthrough for the app's Direct AI mode ----------
+//
+// Vaenyx does not allow browser CORS, so when the app runs its Direct engine
+// (user's own model key) it fetches JUST the recipe pack here — the model call
+// never touches this Worker. Reuses getRecipe's cache + 409 (re-auth) handling.
+async function doGetRecipe(env, p) {
+  const methodId = p && p.methodId;
+  if (!methodId) { const e = new Error('methodId required'); e.status = 400; throw e; }
+  return getRecipe(methodId, env);   // throws { status: 409 } on reauth
 }
 
 // ---------- sendCorrection: Vanta flywheel feedback forwarder ----------
