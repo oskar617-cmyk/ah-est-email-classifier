@@ -47,7 +47,7 @@ Set in the Cloudflare dashboard (**Workers & Pages → ah-estimating-classifier 
 | Name             | Type   | Value                                                  |
 |------------------|--------|--------------------------------------------------------|
 | `GEMINI_API_KEY` | Secret | Gemini API key from https://aistudio.google.com        |
-| `CORS_ORIGINS`   | Text   | `https://oskar617-cmyk.github.io` (the PWA's origin)   |
+| `CORS_ORIGINS`   | Text   | `https://oskar617-cmyk.github.io`(已关停;现用 pages.dev,CORS 清理待批) |
 
 ## Deploy
 

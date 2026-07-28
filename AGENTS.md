@@ -32,6 +32,7 @@
 - method 名 / schema / 门禁配置 = ah-estimating 的公共接口:跨 repo 先协调。
 
 ## 9. Shared Rulesets
+(AH-PWA-MSAL 不适用:本 repo 非 PWA、无 MSAL。)
 
 <!-- SHARED-RULESET:AH-SUITE VERSION:2 UPDATED:2026-07-28 -->
 - 套件:Auzzie Homes Pty Ltd(墨尔本建筑公司)内部工作 app 套件;各 app 经 jobCode 互联;**`ah-jobs-rego` 是全套件 job 数据唯一 source of truth,任何 app 不得自建 job list**。
@@ -40,7 +41,6 @@
 - 本地测试连的是**真 SharePoint 数据**:测试 job 用明显 TEST 名,测完删除。
 - AI 功能默认经 Cloudflare Worker 代理调用(模型 key 不写进前端代码;用户在设置里自带 key 的 Direct 模式除外)。
 - 套件踩坑库 = ah-files repo 的 `docs/LESSONS.md`(L 编号);动工前读一遍,踩到 >30 分钟的架构坑必须加一条(在只见本 repo 的环境读不到时,请 Oskar 提供)。
-(AH-PWA-MSAL 不适用:本 repo 非 PWA、无 MSAL。)
 
 ## 10. Known Hazards
 - push 即上线:半成品绝不 push。
