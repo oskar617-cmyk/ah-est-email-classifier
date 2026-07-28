@@ -21,6 +21,7 @@
 无持久数据;浏览器永不持令牌(app→Worker→Vaenyx/Gemini);门禁 = Origin 白名单 + 限流。
 
 ## 6. Commands
+- URL:https://ah-est-email-classifier.oskar617.workers.dev。
 - 部署:Cloudflare 原生 Git 集成——**push 到 main 即自动部署上线**(push 前逐次问)。
 - GitHub repo:github.com/oskar617-cmyk/ah-est-email-classifier(private)。
 
