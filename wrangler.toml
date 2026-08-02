@@ -6,7 +6,9 @@
 # stop resolving.
 #
 # SECRETS (never in this file — set via `wrangler secret put` / dashboard):
-#   - GEMINI_API_KEY   -> Gemini API key
+#   - GEMINI_API_KEY   -> Gemini API key (since v0.26 only a FALLBACK — the
+#                         live key is pasted in AH Estimating Settings and
+#                         lives in the KEYS KV namespace, see bottom)
 #   - VANTA_APP_TOKEN  -> Vanta app token (fetchRecipe scope) for the Mode-B
 #                         method runner. When unset, runMethod falls back to the
 #                         bundled fixtures (offline). Stored locally at
@@ -34,8 +36,19 @@ CORS_ORIGINS = "https://ah-estimating.pages.dev,https://oskar617-cmyk.github.io"
 # the MSAL ID token) must be on this list. Comma-separated, case-insensitive.
 # Emails are config, never code — add people here, not in worker.js.
 EMAIL_ALLOWLIST = "oskar@auhs.com.au,est@auhs.com.au"
+# Who may SET provider keys (the setProviderKey task — paste/rotate the company
+# Gemini key from AH Estimating Settings). A subset of the users above: using
+# the AI is not the same privilege as rotating its keys.
+KEY_ADMINS = "oskar@auhs.com.au,est@auhs.com.au"
 # Sign-in gate rollout switch. "0" = soft: a request that BRINGS a ticket must
 # bring a valid one, a ticketless request still passes (the already-deployed
 # app keeps working until it ships tickets). Flip to "1" once the app attaches
 # tickets everywhere — from then on every request needs one.
 REQUIRE_AUTH = "0"
+
+# Company key store. The Gemini key an admin pastes in AH Estimating Settings
+# lives here under "provider-key:gemini", shared by every allowed caller on
+# every machine; the GEMINI_API_KEY secret becomes the fallback.
+[[kv_namespaces]]
+binding = "KEYS"
+id = "49e65d8de4e74a6c8b39676b5e96ed8b"

@@ -5,9 +5,11 @@
 //   - extractAmount    : pull a quote amount out of body / PDF text
 //   - summarizeFilename: short PascalCase snippet for a filename slot
 //
-// The Gemini API key never ships to the browser. It lives as a Cloudflare
-// Worker secret named GEMINI_API_KEY. CORS_ORIGINS is a comma-separated
-// list of allowed origins (defaults to "*" if absent).
+// The Gemini API key never ships to the browser. Since v0.26 it lives in the
+// KEYS KV namespace ("provider-key:gemini" — pasted once by an admin in AH
+// Estimating Settings, rotated by pasting again), with the GEMINI_API_KEY
+// Worker secret kept as a deploy-time fallback. CORS_ORIGINS is a
+// comma-separated list of allowed origins (defaults to "*" if absent).
 //
 // Endpoint: POST /  (root). The PWA's CONFIG.classifierUrl points here.
 // Request body:  { task, payload }
@@ -79,8 +81,16 @@
 //               is unset/0: a request that BRINGS a ticket must bring a valid
 //               one, a ticketless request still passes (deployed app keeps
 //               working until it ships tickets). Flip REQUIRE_AUTH=1 to close.
-//               Authorization joins the CORS allow-list for the preflight. (current)
-const VERSION = 'v0.25';
+//               Authorization joins the CORS allow-list for the preflight.
+//   v0.26 — company key store: an admin pastes the Gemini key ONCE in AH
+//           Estimating (Settings → Model Connections); it lives in KV as
+//           "provider-key:gemini" and every task resolves it via geminiKey()
+//           (60s isolate cache -> KV -> GEMINI_API_KEY secret fallback). New
+//           tasks: setProviderKey (KEY_ADMINS only, hard-gated even in soft
+//           auth mode, candidate key validated against Gemini BEFORE storing)
+//           and keyStatus (configured/source/last4 — the key itself never
+//           goes back to the browser). (current)
+const VERSION = 'v0.26';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -142,27 +152,28 @@ export default {
     if (!auth.ok && (auth.present || String(env.REQUIRE_AUTH || '') === '1')) {
       return jsonResponse({ error: auth.message }, 401, corsHeaders);
     }
-    if (!env.GEMINI_API_KEY) {
-      return jsonResponse({ error: 'GEMINI_API_KEY not configured' }, 500, corsHeaders);
-    }
-
     let body;
     try { body = await request.json(); }
     catch (e) { return jsonResponse({ error: 'Invalid JSON body' }, 400, corsHeaders); }
 
+    // NB: no pre-dispatch "key configured?" check — each Gemini task resolves
+    // the key via geminiKey(env), whose per-task error tells the human WHERE
+    // to fix it (paste it in Settings), which a blanket 500 here never could.
     const { task, payload = {} } = body || {};
     try {
       let result;
-      if (task === 'classify')               result = await doClassify(env.GEMINI_API_KEY, payload);
-      else if (task === 'extractAmount')     result = await doExtractAmount(env.GEMINI_API_KEY, payload);
-      else if (task === 'visionAmount')      result = await doVisionAmount(env.GEMINI_API_KEY, payload);
-      else if (task === 'visionOcr')         result = await doVisionOcr(env.GEMINI_API_KEY, payload);
-      else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(env.GEMINI_API_KEY, payload);
-      else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
+      if (task === 'classify')               result = await doClassify(await geminiKey(env), payload);
+      else if (task === 'extractAmount')     result = await doExtractAmount(await geminiKey(env), payload);
+      else if (task === 'visionAmount')      result = await doVisionAmount(await geminiKey(env), payload);
+      else if (task === 'visionOcr')         result = await doVisionOcr(await geminiKey(env), payload);
+      else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(await geminiKey(env), payload);
+      else if (task === 'summarizeFilename') result = await doSummarizeFilename(await geminiKey(env), payload);
       else if (task === 'runPrompt')         result = await doRunPrompt(env, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else if (task === 'getRecipe')         result = await doGetRecipe(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
+      else if (task === 'setProviderKey')    result = await doSetProviderKey(env, payload, auth);
+      else if (task === 'keyStatus')         result = await doKeyStatus(env, payload, auth);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
       return jsonResponse({ result }, 200, corsHeaders);
     } catch (err) {
@@ -170,6 +181,11 @@ export default {
       // so the PWA can prompt the Owner to re-authorize.
       if (err && err.status === 409) {
         return jsonResponse({ error: 'needs-reauth' }, 409, corsHeaders);
+      }
+      // The key-store tasks gate HARD inside the handler (soft mode does not
+      // apply to them) — let their 401/403 out with the human message intact.
+      if (err && (err.status === 401 || err.status === 403)) {
+        return jsonResponse({ error: err.message }, err.status, corsHeaders);
       }
       if (err && err.status === 400) {
         return jsonResponse({ error: (err.message) || 'Bad request' }, 400, corsHeaders);
@@ -347,6 +363,130 @@ ${safe(p.attachmentText)}`;
   return { summary };
 }
 
+// ---------- company key store (geminiKey / setProviderKey / keyStatus) ----------
+//
+// The Gemini key is pasted ONCE by an admin in AH Estimating (Settings →
+// Model Connections) and lives in KV, so every allowed caller on every
+// machine shares it and rotating it is just pasting a new one. The browser
+// NEVER gets the key back — keyStatus reports last4 at most. The deploy-time
+// GEMINI_API_KEY secret stays as a fallback so nothing breaks before the
+// first paste (and nothing dies if KV has an outage).
+const KV_KEY_GEMINI = 'provider-key:gemini';
+// Per-isolate cache: one KV read per isolate per minute, and a rotation still
+// lands everywhere within 60s (immediately on the isolate that stored it —
+// see bustKeyCache in doSetProviderKey).
+const KEY_CACHE_TTL_MS = 60 * 1000;
+let keyCache = { value: null, at: 0 };
+
+// Resolve the Gemini key for a task: cache -> KV -> env secret -> a human
+// error that says WHERE to fix it. Every task that talks to Gemini must come
+// through here — nothing else reads env.GEMINI_API_KEY.
+async function geminiKey(env) {
+  if (keyCache.value && (Date.now() - keyCache.at) < KEY_CACHE_TTL_MS) return keyCache.value;
+  const { value } = await geminiKeySource(env);
+  if (!value) throw new Error('The company Gemini key is not set — an admin can paste it in AH Estimating Settings (Model Connections)');
+  keyCache = { value, at: Date.now() };
+  return value;
+}
+
+// Where the key comes from RIGHT NOW (no cache — status must be honest):
+// 'app' (the KV record pasted in the app) beats 'fallback-secret' (deploy-time
+// env secret) beats 'none'. Shared by geminiKey and doKeyStatus so the two
+// can never disagree about precedence.
+async function geminiKeySource(env) {
+  const rec = await readKeyRecord(env);
+  if (rec && rec.apiKey) return { source: 'app', value: String(rec.apiKey), rec };
+  if (env && env.GEMINI_API_KEY) return { source: 'fallback-secret', value: env.GEMINI_API_KEY, rec: null };
+  return { source: 'none', value: '', rec: null };
+}
+
+// Read + parse the KV record { apiKey, setBy, setAt }. A KV outage or a
+// mangled record must not take the AI down while the deploy-time secret still
+// exists, so failures degrade to "no record" instead of throwing.
+async function readKeyRecord(env) {
+  if (!(env && env.KEYS)) return null;   // binding absent (old deploy) -> fallback path
+  let raw = null;
+  try { raw = await env.KEYS.get(KV_KEY_GEMINI); }
+  catch (e) { console.warn('KEYS read failed:', e && e.message); return null; }
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+// The 60s cache would otherwise keep serving the OLD key for up to a minute
+// on the isolate that just stored a new one — bust it so a rotation is live
+// immediately where it happened. (Exported for the offline tests too.)
+function bustKeyCache() { keyCache = { value: null, at: 0 }; }
+
+// Both key-store tasks demand a VALID ticket even while REQUIRE_AUTH=0
+// (present + verified + allow-listed). Soft mode exists so the deployed app
+// keeps WORKING before it ships tickets — key admin work has no such excuse.
+function requireValidTicket(auth) {
+  if (auth && auth.ok) return;
+  const e = new Error((auth && auth.message) || 'Sign in to AH Estimating first');
+  e.status = 401;
+  throw e;
+}
+
+// setProviderKey { provider, apiKey }: store/rotate the company key.
+// KEY_ADMINS is a second, smaller list on top of EMAIL_ALLOWLIST — using the
+// AI is not the same privilege as changing its key.
+async function doSetProviderKey(env, p, auth) {
+  requireValidTicket(auth);
+  const admins = parseAllowed(env.KEY_ADMINS || '').map(x => x.toLowerCase());
+  if (!admins.includes(auth.email)) {
+    const e = new Error(`Only a key admin can change the company key — this account (${auth.email}) is not on the admin list`);
+    e.status = 403; throw e;
+  }
+  const provider = (p && p.provider) || '';
+  if (provider !== 'gemini') {
+    const e = new Error('Only the gemini key lives here so far');
+    e.status = 400; throw e;
+  }
+  const apiKey = (p && typeof p.apiKey === 'string') ? p.apiKey.trim() : '';
+  // Plausibility only — the REAL check is the live Gemini call below. This
+  // just catches an empty paste or a key chopped by a line break.
+  if (apiKey.length < 20 || /\s/.test(apiKey)) {
+    const e = new Error('That does not look like an API key — paste the whole key, with no spaces');
+    e.status = 400; throw e;
+  }
+  if (!env.KEYS) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
+  // Validate BEFORE storing: one tiny real Gemini call with the CANDIDATE
+  // key. A typo'd key must never replace a working one, and the admin should
+  // see Gemini's actual reason, not a generic "failed".
+  try {
+    await callGemini(apiKey, 'Return exactly this JSON: {"ok":true}');
+  } catch (err) {
+    const e = new Error(`That key was rejected, so it was NOT saved — ${String((err && err.message) || 'Gemini did not answer').slice(0, 300)}`);
+    e.status = 400; throw e;
+  }
+  const rec = { apiKey, setBy: auth.email, setAt: new Date().toISOString() };
+  await env.KEYS.put(KV_KEY_GEMINI, JSON.stringify(rec));
+  bustKeyCache();
+  // NEVER echo the key — last4 is enough for the admin to recognise it.
+  return { ok: true, provider: 'gemini', last4: apiKey.slice(-4), setBy: rec.setBy, setAt: rec.setAt };
+}
+
+// keyStatus { provider? }: is a key configured and where would it come from.
+// last4/setBy/setAt come from the KV record only — the env secret is opaque
+// by design (nobody pasted it in the app, so there is nothing to attribute).
+async function doKeyStatus(env, p, auth) {
+  requireValidTicket(auth);
+  const provider = (p && p.provider) || 'gemini';
+  if (provider !== 'gemini') {
+    const e = new Error('Only the gemini key lives here so far');
+    e.status = 400; throw e;
+  }
+  const { source, rec } = await geminiKeySource(env);
+  return {
+    provider,
+    configured: source !== 'none',
+    source,
+    last4: rec ? String(rec.apiKey).slice(-4) : '',
+    setBy: (rec && rec.setBy) || '',
+    setAt: (rec && rec.setAt) || ''
+  };
+}
+
 // ---------- runPrompt: app-owned prompt runner (embed era) ----------
 //
 // The estimating-specific prompts + output schemas live IN THE APP repo
@@ -366,8 +506,9 @@ async function doRunPrompt(env, p) {
   const contents = contentsOf(p);
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
   const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
+  const apiKey = await geminiKey(env);   // after the 400 checks — a bad request should say so, not "no key"
 
-  let raw = await geminiGenerate(env.GEMINI_API_KEY, contents);
+  let raw = await geminiGenerate(apiKey, contents);
   let output = parseJson(raw);
   if (!schema) return { output, raw };
 
@@ -378,7 +519,7 @@ async function doRunPrompt(env, p) {
       { role: 'model', parts: [{ text: raw || '' }] },
       { role: 'user', parts: [{ text: `Your previous answer failed validation: ${errs.slice(0, 5).join('; ')}. Return CORRECTED strict JSON only that matches the schema.` }] }
     ]);
-    raw = await geminiGenerate(env.GEMINI_API_KEY, retry);
+    raw = await geminiGenerate(apiKey, retry);
     output = parseJson(raw);
     errs = validateOutput(output, schema);
   }
@@ -448,9 +589,10 @@ async function doRunMethod(env, p) {
   // images alongside the recipe input — they ride as Gemini media parts, not
   // as recipe input (schemas stay small). Text-only methods are unchanged.
   const media = mediaFromPayload({ images: p && p.images });
+  const apiKey = await geminiKey(env);
   const ask = (q) => media.length
-    ? callGeminiVision(env.GEMINI_API_KEY, q, media, GEMINI_MODEL)
-    : callGemini(env.GEMINI_API_KEY, q);
+    ? callGeminiVision(apiKey, q, media, GEMINI_MODEL)
+    : callGemini(apiKey, q);
 
   let output = parseJson(await ask(prompt));
   let errs = validateOutput(output, pack.outputSchema);
@@ -613,7 +755,8 @@ function jsType(d) {
 
 // Exported for offline unit tests (node). Cloudflare only uses `export default`.
 export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
-         doRunPrompt, contentsOf, verifyCaller, verifyIdToken };
+         doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
+         geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
