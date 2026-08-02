@@ -9,7 +9,7 @@
 2. 消费端:ah-estimating 的 `js/runner.js` / `js/ai.js` 与其 docs/roadmap(Worker 版本变迁记录在那边)
 
 ## 3. Current Snapshot
-以 `worker.js` VERSION 为准(交接文档曾停在 v0.04,实际早已远超:v0.21+ 含 `gemini-3.1-flash-lite` 单模型、visionOcr、Origin 白名单 403 + CORS fail-closed + 90/min 限流门禁——细节见 ah-estimating docs/roadmap)。(替换制。)
+以 `worker.js` VERSION 为准(版本史在文件头注释)。v0.25 起进入**内嵌时代**(决策见 ah-estimating docs/architecture.md「AI 能力布局(2026-08-02)」):新任务 `runPrompt`(app 自带提示词 + 可选 schema,本 Worker 只验票、加钥匙、转发、校验出 outputValid)+ **登录票门对所有任务生效**(MSAL ID token:JWKS 验签 RS256 + tid + aud + exp + `EMAIL_ALLOWLIST` env var;`REQUIRE_AUTH=0` 为 soft——带票必须验过、没带票放行,app 全量带票后翻 1 关死)。旧任务(classify/extractAmount/vision*/matchBudgetItem/summarizeFilename/runMethod/getRecipe/sendCorrection)全部保留,等 app 切换完再退役。Origin 白名单 + CORS fail-closed + 90/min 限流保留为第二层。(替换制。)
 
 ## 4. Hard Rules
 - API contract 与 ah-estimating 端锁定:改动必须两 repo 同步。

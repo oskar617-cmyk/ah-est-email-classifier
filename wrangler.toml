@@ -30,3 +30,12 @@ VANTA_BASE = "https://kaa-nuc.tailc0993f.ts.net"
 # Origins allowed to call this Worker. Live PWA is on pages.dev; github.io is
 # the backup host. Add localhost origins here if testing the runner locally.
 CORS_ORIGINS = "https://ah-estimating.pages.dev,https://oskar617-cmyk.github.io"
+# Who may use the AI service: the signed-in user's email (preferred_username in
+# the MSAL ID token) must be on this list. Comma-separated, case-insensitive.
+# Emails are config, never code — add people here, not in worker.js.
+EMAIL_ALLOWLIST = "oskar@auhs.com.au,est@auhs.com.au"
+# Sign-in gate rollout switch. "0" = soft: a request that BRINGS a ticket must
+# bring a valid one, a ticketless request still passes (the already-deployed
+# app keeps working until it ships tickets). Flip to "1" once the app attaches
+# tickets everywhere — from then on every request needs one.
+REQUIRE_AUTH = "0"

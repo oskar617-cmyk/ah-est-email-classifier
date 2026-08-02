@@ -66,8 +66,21 @@
 //   v0.24 — add getRecipe task: recipe-pack passthrough for the app's Direct AI
 //           mode (Vaenyx blocks browser CORS, so the app fetches JUST the recipe
 //           here and runs the model itself on the user's own key). Same cache /
-//           409 semantics as runMethod; still behind the Origin gate (current)
-const VERSION = 'v0.24';
+//           409 semantics as runMethod; still behind the Origin gate
+//   v0.25 — embed era, step 1 (app AGENTS「AI 内嵌化」). Two things:
+//           (1) runPrompt — the app now OWNS its prompts (js/methods/ in the
+//               app repo); this Worker just adds the key, forwards, and when the
+//               payload carries a JSON-Schema validates the output (same
+//               validate/retry semantics as runMethod, so outputValid means the
+//               same thing everywhere). Old tasks all stay until cutover.
+//           (2) sign-in gate — every task now checks the caller's MSAL ID token
+//               (RS256 signature via the tenant's JWKS, tid, aud, exp, and the
+//               user on the EMAIL_ALLOWLIST env var). Soft while REQUIRE_AUTH
+//               is unset/0: a request that BRINGS a ticket must bring a valid
+//               one, a ticketless request still passes (deployed app keeps
+//               working until it ships tickets). Flip REQUIRE_AUTH=1 to close.
+//               Authorization joins the CORS allow-list for the preflight. (current)
+const VERSION = 'v0.25';
 
 // The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
 // is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
@@ -97,7 +110,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': corsOrigin || 'null',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
       'Access-Control-Max-Age': '600',
       'X-Worker-Version': VERSION
     };
@@ -120,6 +133,15 @@ export default {
     if (rateLimited()) {
       return jsonResponse({ error: 'Rate limited — slow down and retry shortly' }, 429, corsHeaders);
     }
+    // SIGN-IN GATE (all tasks): the Origin gate keeps browsers honest but is
+    // spoofable server-side — this is the real lock. Soft while REQUIRE_AUTH
+    // is unset/0: a request that BRINGS a ticket must bring a VALID one (our
+    // own app should never send junk), a ticketless request still passes so
+    // the already-deployed app keeps working until it ships tickets.
+    const auth = await verifyCaller(request, env);
+    if (!auth.ok && (auth.present || String(env.REQUIRE_AUTH || '') === '1')) {
+      return jsonResponse({ error: auth.message }, 401, corsHeaders);
+    }
     if (!env.GEMINI_API_KEY) {
       return jsonResponse({ error: 'GEMINI_API_KEY not configured' }, 500, corsHeaders);
     }
@@ -137,6 +159,7 @@ export default {
       else if (task === 'visionOcr')         result = await doVisionOcr(env.GEMINI_API_KEY, payload);
       else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(env.GEMINI_API_KEY, payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(env.GEMINI_API_KEY, payload);
+      else if (task === 'runPrompt')         result = await doRunPrompt(env, payload);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else if (task === 'getRecipe')         result = await doGetRecipe(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
@@ -324,6 +347,89 @@ ${safe(p.attachmentText)}`;
   return { summary };
 }
 
+// ---------- runPrompt: app-owned prompt runner (embed era) ----------
+//
+// The estimating-specific prompts + output schemas live IN THE APP repo
+// (js/methods/ — one file per task, promptVersion'd there). This Worker no
+// longer needs to know what the task IS: it adds the Gemini key, forwards,
+// and — when the payload carries a schema — validates the output shape with
+// the same validate/one-retry semantics as doRunMethod, so outputValid means
+// exactly the same thing to every consumer.
+//
+// payload: { prompt: "..." }  OR  { messages: [{ role:'user'|'model', text }] }
+//          images?: [{ base64, mimeType }]   — ride as media on the last user turn
+//          schema?: JSON-Schema (draft-07 SUBSET — see validateOutput; keep app
+//                   schemas inside that subset, never lean on unknown keywords)
+// returns: { output, outputValid }           with a schema
+//          { output, raw }                   without one (output = best-effort JSON)
+async function doRunPrompt(env, p) {
+  const contents = contentsOf(p);
+  if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
+  const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
+
+  let raw = await geminiGenerate(env.GEMINI_API_KEY, contents);
+  let output = parseJson(raw);
+  if (!schema) return { output, raw };
+
+  let errs = validateOutput(output, schema);
+  if (errs.length) {
+    // One conversational retry: show the model its own answer and the errors.
+    const retry = contents.concat([
+      { role: 'model', parts: [{ text: raw || '' }] },
+      { role: 'user', parts: [{ text: `Your previous answer failed validation: ${errs.slice(0, 5).join('; ')}. Return CORRECTED strict JSON only that matches the schema.` }] }
+    ]);
+    raw = await geminiGenerate(env.GEMINI_API_KEY, retry);
+    output = parseJson(raw);
+    errs = validateOutput(output, schema);
+  }
+  return { output: output != null ? output : null, outputValid: errs.length === 0 };
+}
+
+// Normalise a runPrompt payload into Gemini `contents`. A plain prompt becomes
+// one user turn; a messages array keeps its turns. Page images attach to the
+// LAST user turn (that is the turn the question is in).
+function contentsOf(p) {
+  const media = mediaFromPayload({ images: p && p.images })
+    .map(m => ({ inline_data: { mime_type: m.mimeType || 'image/png', data: m.data } }));
+  if (Array.isArray(p && p.messages) && p.messages.length) {
+    const contents = p.messages
+      .filter(m => m && typeof m.text === 'string' && m.text)
+      .map(m => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: m.text }] }));
+    if (!contents.length) return null;
+    for (let i = contents.length - 1; i >= 0; i--) {
+      if (contents[i].role === 'user') { contents[i].parts.push(...media); break; }
+    }
+    return contents;
+  }
+  if (p && typeof p.prompt === 'string' && p.prompt) {
+    return [{ role: 'user', parts: [{ text: p.prompt }, ...media] }];
+  }
+  return null;
+}
+
+// Low-level Gemini call taking prepared `contents` (multi-turn capable). The
+// older callGemini/callGeminiVision keep their own request-building untouched —
+// every pre-embed task keeps its exact behaviour until it is retired.
+async function geminiGenerate(apiKey, contents) {
+  const url =
+    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
+    '?key=' + encodeURIComponent(apiKey);
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents,
+      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
+    })
+  });
+  if (!res.ok) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
 // ---------- runMethod: Vanta Mode-B recipe runner ----------
 //
 // Fetch a method's recipe pack from Vanta (or a local fixture when no token is
@@ -506,7 +612,8 @@ function jsType(d) {
 }
 
 // Exported for offline unit tests (node). Cloudflare only uses `export default`.
-export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod };
+export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
+         doRunPrompt, contentsOf, verifyCaller, verifyIdToken };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
@@ -566,6 +673,107 @@ async function callGeminiVision(apiKey, prompt, media, model) {
   const data = await res.json();
   return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
+
+// ---------- sign-in gate (MSAL ID token) ----------
+//
+// The PWA sends the signed-in user's MSAL ID token as `Authorization: Bearer`.
+// We verify the RS256 signature against the tenant's published JWKS, then the
+// claims: our tenant (tid), our app (aud), not expired, and the user's email on
+// EMAIL_ALLOWLIST (comma-separated env var — emails are config, never code).
+// Failure messages are written for the human who will read them in a toast.
+//
+// Tenant + app id are the suite's identity — the same constants every AH app
+// carries in config.js — not per-deploy configuration.
+const TENANT_ID = 'ff968505-cca0-4cd1-9f6d-68ce6eaf06c7';
+const APP_CLIENT_ID = '07eef32f-8834-424d-b4fd-ad04c91a3fcf';
+const JWKS_URL = `https://login.microsoftonline.com/${TENANT_ID}/discovery/v2.0/keys`;
+const JWKS_TTL_MS = 6 * 60 * 60 * 1000;
+const CLOCK_SKEW_S = 120;
+let jwksCache = { keys: null, at: 0 };
+
+// -> { ok, present, email?, message? }. `present` lets the caller distinguish
+// "no ticket at all" (soft mode passes it) from "a ticket that failed" (never
+// passes — our own app must not be sending junk).
+async function verifyCaller(request, env) {
+  const m = (request.headers.get('Authorization') || '').match(/^Bearer\s+(.+)$/i);
+  if (!m) return { ok: false, present: false, message: 'Your sign-in ticket is missing — reload AH Estimating and try again' };
+  let claims;
+  try { claims = await verifyIdToken(m[1]); }
+  catch (e) { return { ok: false, present: true, message: e.message }; }
+  const email = String(claims.preferred_username || claims.email || claims.upn || '').toLowerCase();
+  const allowed = parseAllowed(env.EMAIL_ALLOWLIST || '').map(x => x.toLowerCase());
+  if (!allowed.length) return { ok: false, present: true, message: 'The AI service has no allow-list configured — tell the admin (EMAIL_ALLOWLIST is empty)' };
+  if (!allowed.includes(email)) return { ok: false, present: true, message: `This account (${email || 'unknown'}) is not set up for the AI service — ask the admin to add it` };
+  return { ok: true, present: true, email };
+}
+
+// Verify signature + standard claims; returns the claims or throws with a
+// human-readable message. Signature first would waste a JWKS fetch on an
+// expired ticket, so cheap claim checks run before the crypto.
+async function verifyIdToken(token) {
+  const parts = String(token || '').split('.');
+  if (parts.length !== 3) throw new Error('Your sign-in ticket is damaged — reload AH Estimating and sign in again');
+  let header, claims;
+  try { header = b64urlJson(parts[0]); claims = b64urlJson(parts[1]); }
+  catch (e) { throw new Error('Your sign-in ticket is damaged — reload AH Estimating and sign in again'); }
+  // RS256 only — accepting whatever the header claims is the classic
+  // algorithm-confusion hole ("alg":"none" etc).
+  if (!header || header.alg !== 'RS256') throw new Error('Your sign-in ticket is not the expected kind — sign out and back in');
+  const now = Math.floor(Date.now() / 1000);
+  if (!(typeof claims.exp === 'number' && claims.exp > now - CLOCK_SKEW_S)) {
+    throw new Error('Your sign-in ticket has expired — the app will fetch a fresh one when you retry');
+  }
+  if (typeof claims.nbf === 'number' && claims.nbf > now + CLOCK_SKEW_S) {
+    throw new Error('Your sign-in ticket is not valid yet — check this computer\'s clock');
+  }
+  if (claims.tid !== TENANT_ID) throw new Error('This sign-in belongs to a different organisation — use your Auzzie Homes account');
+  if (claims.aud !== APP_CLIENT_ID) throw new Error('This sign-in ticket is for a different app — reload AH Estimating and sign in again');
+  if (claims.iss !== `https://login.microsoftonline.com/${TENANT_ID}/v2.0`) {
+    throw new Error('This sign-in ticket did not come from Microsoft sign-in — sign out and back in');
+  }
+  const jwk = await jwkFor(header.kid);
+  if (!jwk) throw new Error('Your sign-in ticket was signed with an unknown key — sign out and back in');
+  const key = await crypto.subtle.importKey('jwk', { kty: jwk.kty, n: jwk.n, e: jwk.e },
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
+  const okSig = await crypto.subtle.verify('RSASSA-PKCS1-v1_5', key,
+    b64urlBytes(parts[2]), new TextEncoder().encode(parts[0] + '.' + parts[1]));
+  if (!okSig) throw new Error('Your sign-in ticket failed verification — sign out and back in');
+  return claims;
+}
+
+// Microsoft rotates signing keys; an unknown kid gets ONE forced re-fetch
+// (covers rotation mid-cache) before we give up.
+async function jwkFor(kid) {
+  let keys = await getJwks(false);
+  let jwk = keys.find(k => k && k.kid === kid);
+  if (!jwk) { keys = await getJwks(true); jwk = keys.find(k => k && k.kid === kid); }
+  return jwk || null;
+}
+
+async function getJwks(forceFresh) {
+  if (!forceFresh && jwksCache.keys && (Date.now() - jwksCache.at) < JWKS_TTL_MS) return jwksCache.keys;
+  let res;
+  try { res = await fetch(JWKS_URL); } catch (e) { res = null; }
+  if (!res || !res.ok) {
+    // Serve stale keys over failing everyone: rotation is slow, outages aren't.
+    if (jwksCache.keys) return jwksCache.keys;
+    throw new Error('Sign-in checking is unavailable right now (key service unreachable) — try again shortly');
+  }
+  const data = await res.json();
+  jwksCache = { keys: (data && data.keys) || [], at: Date.now() };
+  return jwksCache.keys;
+}
+
+function b64urlBytes(s) {
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  const pad = s.length % 4 ? '='.repeat(4 - (s.length % 4)) : '';
+  const bin = atob(s + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function b64urlJson(s) { return JSON.parse(new TextDecoder().decode(b64urlBytes(s))); }
 
 // ---------- helpers ----------
 
