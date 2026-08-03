@@ -1,38 +1,42 @@
 # ah-est-email-classifier Agent Rules(纯 Cloudflare Worker)
 
 ## 1. Identity
-- 代理 Gemini 的 Worker,服务 AH Estimating 的 AI 管线:runMethod(取 Vaenyx 配方 → Gemini → draft-07 schema 校验)承载 estimating 的 method 家族(classify / quote-match / quote-questions / quote-analysis / visionOcr / takeoff 等),另有早期任务(extractAmount / summarizeFilename)。
-- 技术特征:Uses MSAL: no · Deploy target: Cloudflare Worker(**纯 Worker:push 即上线、无 staging——push/deploy 逐次先问 Oskar**)· PWA: no。
+- AH Estimating 的公司 AI gateway。主路径 `runPrompt` 只做登录验票、取公司 Gemini key、转发 app 自带 prompt/media、可选 JSON-Schema 校验;另保留 vision/金额辅助任务。Vaenyx `runMethod/getRecipe/sendCorrection` 仅继续服务 takeoff。
+- 技术特征:Uses MSAL: token validation only(无前端 client) · Deploy target: Cloudflare Worker(**纯 Worker:push 即上线、无 staging——push/deploy 逐次先问 Oskar**)· PWA: no。
 
 ## 2. Read First
 1. `worker.js` 头部 VERSION + 版本史注释(响应带 `X-Worker-Version`)
-2. 消费端:ah-estimating 的 `js/runner.js` / `js/ai.js` 与其 docs/roadmap(Worker 版本变迁记录在那边)
+2. `docs/architecture.md` — 当前 contract、安全边界、升级顺序
+3. 消费端:ah-estimating 的 `js/runner.js` / `js/ai.js` / `js/classification.js` / `js/methods/` / `js/flywheel.js`
 
 ## 3. Current Snapshot
-以 `worker.js` VERSION 为准(版本史在文件头注释)。v0.25 起进入**内嵌时代**(决策见 ah-estimating docs/architecture.md「AI 能力布局(2026-08-02)」):新任务 `runPrompt`(app 自带提示词 + 可选 schema,本 Worker 只验票、加钥匙、转发、校验出 outputValid)+ **登录票门对所有任务生效**(MSAL ID token:JWKS 验签 RS256 + tid + aud + exp + `EMAIL_ALLOWLIST` env var;`REQUIRE_AUTH=0` 为 soft——带票必须验过、没带票放行,app 全量带票后翻 1 关死)。旧任务(classify/extractAmount/vision*/matchBudgetItem/summarizeFilename/runMethod/getRecipe/sendCorrection)全部保留,等 app 切换完再退役。Origin 白名单 + CORS fail-closed + 90/min 限流保留为第二层。v0.26:公司 Gemini key 存 KV `provider-key:gemini`(app 内 `setProviderKey` 任务写入——`KEY_ADMINS` 白名单硬门禁、存前先真调一次 Gemini 验证候选 key;`keyStatus` 查状态只回 last4;key 永不回浏览器;`GEMINI_API_KEY` secret 降为 fallback)。(替换制。)
+以 `worker.js` VERSION 为准(版本史在文件头注释)。当前 **v0.26**:`runPrompt` 承载 app-owned prompts;所有任务有 MSAL ID token 门(`REQUIRE_AUTH=0` 暂为 soft,app 冒烟后翻 1);公司 Gemini key 存 KV `provider-key:gemini`,`setProviderKey/keyStatus` 即使 soft 期也硬验票且 key 永不回浏览器。固定 prompt 的 `classify/extractAmount/summarizeFilename` 已无 app 调用,先留兼容;`visionAmount/visionOcr/matchBudgetItem` 仍在用;`runMethod/getRecipe/sendCorrection` 留给 takeoff。(替换制。)
 
 ## 4. Hard Rules
 - API contract 与 ah-estimating 端锁定:改动必须两 repo 同步。
-- Secrets 在 Cloudflare 端:`GEMINI_API_KEY`、`VANTA_APP_TOKEN`(Vaenyx 配方令牌)、CORS/vars 在 wrangler [vars]。
+- estimating 专属 prompt/schema 的唯一权威是 ah-estimating `js/methods/` 与相应 helper;本 Worker 不再新增第二份业务 prompt。
+- Gemini 主 key 只存 `KEYS` KV;`GEMINI_API_KEY` secret 仅 fallback;`VANTA_APP_TOKEN` 仅供 takeoff 的 Vaenyx 路径。key 永不写日志、响应、git。
+- 邮箱只配在 `EMAIL_ALLOWLIST/KEY_ADMINS`,不硬编码进 Worker;`setProviderKey` 必须先真调 Gemini 验 key,成功才覆盖 KV。
 - 根目录 `wrangler.toml` = Worker 标记,绝不跑 Pages 转换。
-- 换 Vaenyx token 后必须冒烟 classify 一次。
+- 换 `VANTA_APP_TOKEN` 后必须冒烟 takeoff 的 `getRecipe/runMethod`,不能拿已内嵌的 classify 当验证。
 
 ## 5. Architecture And Data Boundaries
-无持久数据;浏览器永不持令牌(app→Worker→Vaenyx/Gemini);门禁 = Origin 白名单 + 限流。
+唯一持久数据是 `KEYS` KV 内的公司 Gemini key + setBy/setAt;不存邮件、报价、prompt 或模型输出。主路 app→Worker→Gemini;takeoff 才是 app→Worker→Vaenyx recipe→Gemini。门禁 = MSAL ID token + Origin 白名单 + CORS fail-closed + 90/min 限流。
 
 ## 6. Commands
-- URL:https://ah-est-email-classifier.oskar617.workers.dev。
+- URL:[ah-estimating-classifier.oskar617.workers.dev](https://ah-estimating-classifier.oskar617.workers.dev)。
 - 部署:Cloudflare 原生 Git 集成——**push 到 main 即自动部署上线**(push 前逐次问)。
-- GitHub repo:github.com/oskar617-cmyk/ah-est-email-classifier(private)。
+- GitHub repo:[github.com/oskar617-cmyk/ah-est-email-classifier](https://github.com/oskar617-cmyk/ah-est-email-classifier)(private)。
+- 本地自验:`node --check worker.js`;`node --test test/*.test.mjs`。
 
 ## 7. Verification And Release
-改完先问 Oskar → push(即上线)→ 真打一次 classify 冒烟 → 通知 ah-estimating 侧核对。
+runtime/contract 改动:bump Worker VERSION + 文件头版本史 → 语法 + 全测试 → 与 ah-estimating contract 同步 → 问 Oskar → push(即上线)→ 按所改路径真冒烟。纯 docs 改动不 bump runtime VERSION,但 push 仍须先问。
 
 ## 8. Multi-Agent Conflict Hotspots
-- method 名 / schema / 门禁配置 = ah-estimating 的公共接口:跨 repo 先协调。
+- task payload/response、schema validator、登录票、KV/key admin、Vaenyx takeoff 路径 = ah-estimating 公共接口:跨 repo 先协调。
 
 ## 9. Shared Rulesets
-(AH-PWA-MSAL 不适用:本 repo 非 PWA、无 MSAL。)
+(AH-PWA-MSAL 不适用:本 repo 非 PWA,不负责客户端 MSAL 骨架;只验证 App 送来的 ID token。)
 
 <!-- SHARED-RULESET:AH-SUITE VERSION:2 UPDATED:2026-07-28 -->
 - 套件:Auzzie Homes Pty Ltd(墨尔本建筑公司)内部工作 app 套件;各 app 经 jobCode 互联;**`ah-jobs-rego` 是全套件 job 数据唯一 source of truth,任何 app 不得自建 job list**。
@@ -47,4 +51,4 @@
 - Gemini 免费 tier 配额共享:选模型/加调用前想想额度。
 
 ## 11. Documentation Map
-`worker.js`(VERSION + 版本史注释)· ah-estimating `docs/roadmap.md`(演进史)· `README.md`。
+`worker.js`(VERSION + contract 实码)· `docs/architecture.md`(锁定边界与升级规程)· `docs/roadmap.md`(状态/待办)· `README.md`(GitHub 门面)· `test/`(auth/key/runner)。

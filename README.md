@@ -1,111 +1,93 @@
 # ah-est-email-classifier
 
-A Cloudflare Worker that proxies Google Gemini for the **AH Estimating** PWA's email reply classification. The Gemini API key never reaches the browser — it lives as a Cloudflare Worker secret.
+The server-side AI gateway for the **AH Estimating** PWA. It keeps company credentials out of the browser, verifies the signed-in Auzzie Homes user, and runs Gemini requests on Cloudflare Workers.
 
-- **Live Worker URL:** https://ah-estimating-classifier.oskar617.workers.dev
-- **Worker name in Cloudflare:** `ah-estimating-classifier` (do not rename — see `wrangler.toml`)
-- **Auto-deploy:** every commit to `main` here triggers a Cloudflare deploy (~30s)
+- **Live Worker:** [ah-estimating-classifier.oskar617.workers.dev](https://ah-estimating-classifier.oskar617.workers.dev)
+- **Cloudflare Worker name:** `ah-estimating-classifier` — do not rename
+- **Consumer:** private repo `ah-estimating`
+- **Deployment:** GitHub `main` is connected to Cloudflare; every push deploys production
+- **Current runtime version:** read `VERSION` in `worker.js` and the `X-Worker-Version` response header
 
-## Tech Stack
+## Current Design
 
-- Cloudflare Workers (free tier — 100,000 requests/day)
-- Google Gemini API (`gemini-3-flash`)
-- Single-file `worker.js`, no build step, no npm
+Since Worker v0.25 / AH Estimating v0.86, the app owns its business prompts and schemas in `ah-estimating/js/methods/` and prompt-owning helpers such as `js/classification.js`. The Worker is deliberately a thin server boundary:
 
-## Versioning
+1. Check the request Origin and rate limit.
+2. Verify the caller's MSAL ID token and allow-listed email.
+3. Resolve the company Gemini key from KV, with the deploy-time secret as fallback.
+4. Forward the app-built prompt and optional images to Gemini.
+5. When a schema is supplied, validate once, request one corrected answer if needed, and return `outputValid`.
 
-This Worker tracks a single `VERSION` constant at the top of `worker.js` (e.g. `v0.04`). It's bumped on every release and exposed as the `X-Worker-Version` response header so the live version can be verified post-deploy without reading logs.
+The four embedded estimating tasks are `classify`, `match`, `questions`, and `analysis`. Their prompts do **not** live in this repo. Takeoff remains on the older Vaenyx recipe path because it is deliberately parked outside the embed migration.
 
-To verify: hit any response and check `X-Worker-Version` in the Network tab. Or run `fetch('https://ah-estimating-classifier.oskar617.workers.dev', { method: 'OPTIONS' }).then(r => console.log(r.headers.get('X-Worker-Version')))` in any browser console.
-
-History tracked as a comment block in `worker.js` next to the `VERSION` constant — bump and append on every release.
+Keeping the Worker in its own private repo is intentional: AH Estimating stays a static PWA, company credentials and server-side auth remain outside the browser, and the gateway can be deployed or rolled back independently without copying its source into the app.
 
 ## Endpoint Contract
 
-The PWA depends on this — don't change shapes without updating the PWA in lockstep.
-
-**`POST /`** with JSON body:
+`POST /` with:
 
 ```json
-{ "task": "classify" | "extractAmount" | "summarizeFilename", "payload": { ... } }
+{ "task": "runPrompt", "payload": { "prompt": "...", "schema": {}, "images": [] } }
 ```
 
-Response: `{ "result": { ... } }` on success, `{ "error": "..." }` on failure.
+The app sends its MSAL ID token as `Authorization: Bearer <token>`. Success is `{ "result": ... }`; failure is `{ "error": "human-readable message" }`. Every response carries `X-Worker-Version`.
 
-### Tasks
+### Active Tasks
 
-| Task                 | Payload                                                                                         | Result                                                                                |
-|----------------------|-------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
-| `classify`           | `{ subject, fromName, fromEmail, bodyText, rfqCategory, jobAddress, supplierCompany }`          | `{ classification, confidence }` — classification ∈ Quote / Question / Suspicious / Out-of-Office / Decline / Unrelated |
-| `extractAmount`      | `{ subject, bodyText, attachmentText }`                                                          | `{ amount, currency: "AUD", notes }` — amount is a number or null                     |
-| `summarizeFilename`  | `{ originalName, attachmentText }`                                                               | `{ summary }` — PascalCase, ≤30 chars, alphanumeric only                              |
+| Task | Purpose |
+|---|---|
+| `runPrompt` | Run an app-owned prompt or message sequence, optional images and schema validation |
+| `visionAmount` / `visionOcr` | Read scanned quote images and PDF page renders |
+| `matchBudgetItem` | Match an unmatched quote to a budget item |
+| `setProviderKey` | Key-admin-only Gemini key validation and KV rotation |
+| `keyStatus` | Report configured/source/last4 metadata without returning the key |
+| `runMethod` / `getRecipe` | Vaenyx recipe path retained for takeoff |
+| `sendCorrection` | Vaenyx feedback retained for takeoff; embedded tasks use the app's SharePoint flywheel |
 
-## Secrets / Variables
+The fixed-prompt `classify`, `extractAmount`, and `summarizeFilename` handlers remain temporarily for compatibility, but AH Estimating now sends those prompt-owned paths through `runPrompt`. Do not add new business prompts to this Worker.
 
-Set in the Cloudflare dashboard (**Workers & Pages → ah-estimating-classifier → Settings → Variables and Secrets**), never committed here:
+## Security And Key Storage
 
-| Name             | Type   | Value                                                  |
-|------------------|--------|--------------------------------------------------------|
-| `GEMINI_API_KEY` | Secret | Gemini API key from https://aistudio.google.com        |
-| `CORS_ORIGINS`   | Text   | `https://oskar617-cmyk.github.io`(已关停;现用 pages.dev,CORS 清理待批) |
+- `KEYS` KV stores `provider-key:gemini` as `{ apiKey, setBy, setAt }`.
+- `GEMINI_API_KEY` is a Cloudflare secret used only as fallback when KV has no usable record.
+- `VANTA_APP_TOKEN` is a Cloudflare secret used only by the retained Vaenyx/takeoff path.
+- `EMAIL_ALLOWLIST` controls who may use the service.
+- `KEY_ADMINS` is the smaller set allowed to rotate the company key.
+- `REQUIRE_AUTH=0` is the rollout soft gate: a supplied ticket must validate, while a missing ticket temporarily passes. After the signed-request smoke test, set it to `1`.
+- CORS fails closed and a per-isolate 90 requests/minute limiter remains as defense in depth.
+- Provider keys, quote data, and model outputs must never be logged or committed.
 
-## Deploy
+## Local Verification
 
-Don't paste into the Cloudflare editor. The flow is:
+No build step or runtime package install is required.
 
-1. Update `worker.js` here on GitHub (drag-drop new file → commit to `main`)
-2. Cloudflare detects the commit and auto-deploys within ~30 seconds
-3. Verify via the **Deployments** tab on the Worker page
-
-Rollback: revert the commit on GitHub — Cloudflare auto-deploys the previous version.
-
-## File Structure
-
+```powershell
+node --check worker.js
+node --test test/*.test.mjs
 ```
-worker.js          The whole Worker — single file, ESM default export
-wrangler.toml      Worker name, entry point, runtime compatibility date
-README.md          This file
+
+Tests cover the generic runner/schema path, MSAL ticket gate, and KV key lifecycle. Runtime changes must also bump `VERSION`, append the header history, and be smoke-tested against the changed live path after deployment.
+
+## Deploy And Rollback
+
+This is a pure Worker repo, not a Pages app. Cloudflare native Git integration deploys every push to `main`, so obtain Oskar's approval before each push even for docs-only commits.
+
+Rollback with `git revert`; do not rewrite history. Never paste a separate copy into the Cloudflare editor, convert the repo to Pages, or add a Pages deployment workflow. The root `wrangler.toml` is the deployment identity and its `name` must remain `ah-estimating-classifier`.
+
+## Where Changes Belong
+
+- Estimating prompt/schema/tuning change → `ah-estimating/js/methods/` or its prompt-owning helper.
+- Internal flywheel behavior → `ah-estimating/js/flywheel*.js`.
+- Worker transport, authentication, key storage, validation, or takeoff/Vaenyx bridge → this repo.
+- Any task contract change → update and verify both repos together.
+
+## Files
+
+```text
+worker.js             Runtime, VERSION history, and endpoint contract
+fixtures.js           Offline Vaenyx recipe fixtures
+wrangler.toml         Worker identity, vars, and KEYS binding
+test/                 Runner, auth, and key-store tests
+docs/architecture.md  Locked architecture and upgrade procedure
+docs/roadmap.md       Current state and remaining migration work
 ```
-
-## Free Tier Limits
-
-- **Cloudflare Workers:** 100,000 requests/day, 10ms CPU per request. Wait time on `fetch` to Gemini doesn't count as CPU, so we fit comfortably.
-- **Gemini API (free tier):** the model in use is `gemini-3-flash` (stable, Google's recommended default Flash model). Free tier runs at roughly 10 RPM, 250,000 TPM, 1,500 requests/day — far above real usage at ~3 calls per supplier reply. Check the [current quotas page](https://ai.google.dev/gemini-api/docs/rate-limits) for live numbers.
-
-## Tuning Workflow
-
-Tuning is done in a dedicated Claude sub-chat off the main "AH Estimating" project. The cycle:
-
-1. **Collect data in the PWA.** As supplier replies come in, the PWA logs every Gemini decision plus how you reacted (Confirmed / Edited / Rejected, with original input, Gemini's output, your correction, and an optional "why" note).
-2. **Export.** PWA → Settings → AI Tuning → **Export For Analysis**. Produces a markdown file named `gemini-decisions-YYYY-MM-DD.md`. Each export starts from the last export timestamp, so you never reanalyse the same decisions twice.
-3. **Paste into the sub-chat.** Open the "AH Est Email Classifier" sub-chat in Claude and attach (or paste) the markdown export.
-4. **Diagnosis before code.** Claude analyses for patterns, tells you in plain language what it thinks Gemini is getting wrong systematically, and waits for you to confirm before writing any code. A bad prompt edit is worse than no edit.
-5. **Tuned `worker.js`.** Once you confirm the diagnosis, Claude produces a full updated `worker.js` bundled as `ah-est-email-classifier-[short-summary].zip`, with a clear note of what changed in the prompts.
-6. **Drop into this repo.** Drag the new `worker.js` into the GitHub web UI (overwriting the old one), commit to `main`.
-7. **Auto-deploy.** Cloudflare detects the commit and deploys within ~30 seconds. Next supplier reply uses the smarter prompt.
-8. **Rollback if needed.** If a tuning round makes things worse: GitHub → Commits → revert that commit, OR Cloudflare Worker → Settings → Version History → restore the previous version. Either path puts the old prompts back in <1 minute.
-
-### What stays the same across tuning rounds
-
-- Worker name (`ah-estimating-classifier`)
-- Worker URL
-- Three tasks: `classify`, `extractAmount`, `summarizeFilename`
-- Request/response contract (see Endpoint Contract above)
-- The six classification values (Quote / Question / Suspicious / Out-of-Office / Decline / Unrelated)
-- Gemini model (`gemini-3-flash` — only changed with explicit approval)
-
-Tuning is about the *content* of the prompts inside the three task functions, not the Worker's shape.
-
-## Do NOT Convert This Repo With doc-dropper
-
-The `doc-dropper` tool's "make repo private" toggle migrates a repo from GitHub Pages hosting to Cloudflare Pages hosting. **This repo is not a GitHub Pages site — it's a Cloudflare Worker deployed via Cloudflare's native Git integration.** Running doc-dropper's conversion against this repo would:
-
-- Create a parallel Cloudflare **Pages** project alongside the existing Worker (different products, different deploy targets, both triggered on every commit)
-- Add a `.github/workflows/deploy.yml` that runs `wrangler pages deploy` on every push — useless here, but pollutes the repo and your Cloudflare account
-- Add `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` GitHub Secrets that this repo doesn't need
-
-The Worker itself wouldn't break (Cloudflare's API treats Workers and Pages as separate surfaces — `wrangler pages` can't clobber a Worker's config or bindings), but you'd end up with a dead `ah-est-email-classifier.pages.dev` Pages project sitting next to the real Worker, deploying garbage on every commit.
-
-**If doc-dropper is well-behaved, it should refuse to touch any repo containing a `wrangler.toml` at the root.** That file is the canonical "this repo deploys to Cloudflare as a Worker (or other non-Pages target)" marker.
-
-To manage this repo's privacy: use GitHub's own Settings → General → Danger Zone → Change visibility. No tool needed.

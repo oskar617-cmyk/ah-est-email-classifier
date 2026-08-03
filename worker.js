@@ -1,15 +1,16 @@
 // AH Estimating — Classifier Worker (Cloudflare Workers)
 //
-// Proxies Google Gemini for three tasks the AH Estimating PWA needs:
-//   - classify         : email reply classification (Quote / Question / etc.)
-//   - extractAmount    : pull a quote amount out of body / PDF text
-//   - summarizeFilename: short PascalCase snippet for a filename slot
+// Server-side AI gateway for the AH Estimating PWA. The app owns its
+// estimating-specific prompts; `runPrompt` verifies the caller, adds the
+// company Gemini key, forwards the prompt/media, and optionally validates the
+// JSON result. Compatibility helpers remain for vision/amount matching, while
+// takeoff still uses the Vaenyx-backed runMethod/getRecipe/feedback path.
 //
 // The Gemini API key never ships to the browser. Since v0.26 it lives in the
 // KEYS KV namespace ("provider-key:gemini" — pasted once by an admin in AH
 // Estimating Settings, rotated by pasting again), with the GEMINI_API_KEY
 // Worker secret kept as a deploy-time fallback. CORS_ORIGINS is a
-// comma-separated list of allowed origins (defaults to "*" if absent).
+// comma-separated list of allowed origins and fails closed when absent.
 //
 // Endpoint: POST /  (root). The PWA's CONFIG.classifierUrl points here.
 // Request body:  { task, payload }
