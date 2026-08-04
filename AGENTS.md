@@ -38,13 +38,13 @@ runtime/contract 改动:bump Worker VERSION + 文件头版本史 → 语法 + �
 ## 9. Shared Rulesets
 (AH-PWA-MSAL 不适用:本 repo 非 PWA,不负责客户端 MSAL 骨架;只验证 App 送来的 ID token。)
 
-<!-- SHARED-RULESET:AH-SUITE VERSION:2 UPDATED:2026-07-28 -->
+<!-- SHARED-RULESET:AH-SUITE VERSION:3 UPDATED:2026-08-05 -->
 - 套件:Auzzie Homes Pty Ltd(墨尔本建筑公司)内部工作 app 套件;各 app 经 jobCode 互联;**`ah-jobs-rego` 是全套件 job 数据唯一 source of truth,任何 app 不得自建 job list**。
 - SharePoint 拓扑(锁定):所有 Lists 在 AH Site(`auzziehomes.sharepoint.com/sites/AHSite`);文件/文件夹留各自原站(默认 AHOffice)。List 命名 `[App Name] [Purpose] List`(空格分隔、无连字符);config 存确切字符串,读其他 app 的 List 必须逐字一致。
 - 单一 Entra tenant `ff968505-cca0-4cd1-9f6d-68ce6eaf06c7`;one app one registration;admin `oskar@auhs.com.au`。
 - 本地测试连的是**真 SharePoint 数据**:测试 job 用明显 TEST 名,测完删除。
 - AI 功能默认经 Cloudflare Worker 代理调用(模型 key 不写进前端代码;用户在设置里自带 key 的 Direct 模式除外)。
-- 套件踩坑库 = ah-files repo 的 `docs/LESSONS.md`(L 编号);动工前读一遍,踩到 >30 分钟的架构坑必须加一条(在只见本 repo 的环境读不到时,请 Oskar 提供)。
+- 套件踩坑库 = ah-files repo 的 `docs/LESSONS.md`(L 编号);动工前只扫 `## L` 标题清单(`grep -n '^## L'`,一屏看完),命中相关条目才读该节全文,绝不默认全文加载;踩到 >30 分钟的架构坑必须加一条(在只见本 repo 的环境读不到时,请 Oskar 提供)。
 
 ## 10. Known Hazards
 - push 即上线:半成品绝不 push。
