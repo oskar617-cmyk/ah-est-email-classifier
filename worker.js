@@ -90,15 +90,44 @@
 //           tasks: setProviderKey (KEY_ADMINS only, hard-gated even in soft
 //           auth mode, candidate key validated against Gemini BEFORE storing)
 //           and keyStatus (configured/source/last4 — the key itself never
-//           goes back to the browser). (current)
-const VERSION = 'v0.26';
+//           goes back to the browser).
+//   v0.27 — THE CALLER PICKS THE MODEL. Every Gemini task payload may carry
+//           `model` (a plain Gemini model id); absent or blank falls back to
+//           GEMINI_MODEL, so an older app build keeps working byte-for-byte.
+//           An id that is present but malformed is a 400, never a quiet
+//           downgrade to the default — being answered by a model you did not
+//           choose is the failure this whole change exists to end. The
+//           key-validation call in setProviderKey deliberately stays on the
+//           fixed default: it validates the KEY, not the model. (current)
+const VERSION = 'v0.27';
 
-// The Gemini model for every call (text + vision). gemini-2.5-flash's free tier
-// is only 250 requests/day — too small for bulk folder scans. gemini-3.1-flash-lite
-// has a much larger free allowance and still does vision + strict-JSON output.
+// DEFAULT model — used only when the caller does not name one (see modelFor).
+// gemini-2.5-flash's free tier is only 250 requests/day, too small for bulk
+// folder scans; gemini-3.1-flash-lite has a much larger free allowance and
+// still does vision + strict-JSON output.
 // (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
-// gemini-3.1-flash-lite / gemini-3-flash-preview. Change here to roll back.)
+// gemini-3.1-flash-lite / gemini-3-flash-preview.)
+//
+// This constant is a TRANSITION fallback, not a choice. Which model runs is the
+// app owner's setting, and hardcoding it here is exactly what pinned the whole
+// app to 3.1 for months. It is deleted once the app sends a model on every
+// call. See ah-estimating/docs/architecture.md, "模型与钥匙:一处设置,处处生效".
 const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+
+// Resolve the model for one request. The id is concatenated into the Gemini URL
+// PATH while the api key rides in the same URL's query string, so a `/`, `?` or
+// `#` smuggled in here would rewrite the request — hence the charset gate.
+const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+function modelFor(p) {
+  let m = (p && typeof p.model === 'string') ? p.model.trim() : '';
+  if (!m) return GEMINI_MODEL;
+  m = m.replace(/^models\//, '');   // Google's list API returns "models/<id>"
+  if (!MODEL_ID_RE.test(m)) {
+    const e = new Error(`Unknown model id "${m.slice(0, 60)}" — send a plain Gemini model id, e.g. gemini-3.1-flash-lite`);
+    e.status = 400; throw e;
+  }
+  return m;
+}
 
 import { FIXTURES } from './fixtures.js';
 
@@ -230,7 +259,7 @@ From email: ${safe(p.fromEmail)}
 Body (truncated):
 ${safe(p.bodyText)}`;
 
-  const text = await callGemini(apiKey, prompt);
+  const text = await callGemini(apiKey, prompt, modelFor(p));
   const json = parseJson(text);
   if (!json) return { classification: 'Question', confidence: 0 };
   return {
@@ -257,7 +286,7 @@ ${safe(p.bodyText)}
 ATTACHMENT TEXT (truncated):
 ${safe(p.attachmentText)}`;
 
-  const text = await callGemini(apiKey, prompt);
+  const text = await callGemini(apiKey, prompt, modelFor(p));
   const json = parseJson(text);
   if (!json) return { amount: null, currency: 'AUD', gstIncluded: null };
   return {
@@ -291,7 +320,7 @@ Rules:
 - company = ONLY a supplier name you can actually read; otherwise "".
 - If the image is blank, unreadable, not a price quote (a safety document, a rate card with no single total, etc.), or you cannot clearly SEE a printed total, set amount to null and company to "".
 - NEVER guess, estimate, calculate, or invent. A null is FAR better than a wrong number. Only report figures you can actually read on the page.`;
-  const json = parseJson(await callGeminiVision(apiKey, prompt, media, GEMINI_MODEL));
+  const json = parseJson(await callGeminiVision(apiKey, prompt, media, modelFor(p)));
   return {
     amount: (json && typeof json.amount === 'number') ? json.amount : null,
     gstIncluded: (json && typeof json.gstIncluded === 'boolean') ? json.gstIncluded : null,
@@ -307,7 +336,7 @@ async function doVisionOcr(apiKey, p) {
   const media = mediaFromPayload(p);
   if (!media.length) { const e = new Error('fileBase64 or images required'); e.status = 400; throw e; }
   const prompt = `Transcribe ALL the text you can read in this image/scan, VERBATIM. Preserve line breaks and every number exactly as shown, including dollar amounts and labels like "Total", "Subtotal", "GST", "incl GST", "ex GST", "+ GST". Do not summarise, correct, translate, or add anything. If there is no readable text, return an empty string. Respond with STRICT JSON only: {"text":"<the transcribed text>"}`;
-  const raw = await callGeminiVision(apiKey, prompt, media, GEMINI_MODEL);
+  const raw = await callGeminiVision(apiKey, prompt, media, modelFor(p));
   const json = parseJson(raw);
   return { text: (json && typeof json.text === 'string') ? json.text : (typeof raw === 'string' ? raw : '') };
 }
@@ -340,7 +369,7 @@ Only use a number that appears in the list. If unsure, return -1.
 
 Budget items:
 ${list}`;
-  const text = await callGemini(apiKey, prompt);
+  const text = await callGemini(apiKey, prompt, modelFor(p));
   const json = parseJson(text);
   return { n: (json && Number.isInteger(json.n)) ? json.n : -1 };
 }
@@ -357,7 +386,7 @@ Original filename: ${safe(p.originalName)}
 PDF content (first ~3000 chars):
 ${safe(p.attachmentText)}`;
 
-  const text = await callGemini(apiKey, prompt);
+  const text = await callGemini(apiKey, prompt, modelFor(p));
   const json = parseJson(text);
   let summary = (json && json.summary) || stripExt(p.originalName || 'Document');
   summary = String(summary).replace(/[^A-Za-z0-9]/g, '').slice(0, 30) || 'Document';
@@ -454,6 +483,13 @@ async function doSetProviderKey(env, p, auth) {
   // Validate BEFORE storing: one tiny real Gemini call with the CANDIDATE
   // key. A typo'd key must never replace a working one, and the admin should
   // see Gemini's actual reason, not a generic "failed".
+  //
+  // DELIBERATELY on the fixed default model, not modelFor(p) — do not "finish
+  // the job" by threading the caller's model in here. This call tests the KEY.
+  // On a model the key has no access to it would 404, the catch below would
+  // report "That key was rejected", and a perfectly good key could never be
+  // rotated in. Gemini's own words are passed through, so an admin can still
+  // tell "model not found" from "API key not valid".
   try {
     await callGemini(apiKey, 'Return exactly this JSON: {"ok":true}');
   } catch (err) {
@@ -508,8 +544,12 @@ async function doRunPrompt(env, p) {
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
   const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
   const apiKey = await geminiKey(env);   // after the 400 checks — a bad request should say so, not "no key"
+  // Resolved ONCE: the validation retry below must go back to the SAME model.
+  // Retrying on a different one would mean the answer you finally get is not
+  // from the model you chose, which is the whole thing this release is ending.
+  const model = modelFor(p);
 
-  let raw = await geminiGenerate(apiKey, contents);
+  let raw = await geminiGenerate(apiKey, contents, model);
   let output = parseJson(raw);
   if (!schema) return { output, raw };
 
@@ -520,7 +560,7 @@ async function doRunPrompt(env, p) {
       { role: 'model', parts: [{ text: raw || '' }] },
       { role: 'user', parts: [{ text: `Your previous answer failed validation: ${errs.slice(0, 5).join('; ')}. Return CORRECTED strict JSON only that matches the schema.` }] }
     ]);
-    raw = await geminiGenerate(apiKey, retry);
+    raw = await geminiGenerate(apiKey, retry, model);
     output = parseJson(raw);
     errs = validateOutput(output, schema);
   }
@@ -552,9 +592,9 @@ function contentsOf(p) {
 // Low-level Gemini call taking prepared `contents` (multi-turn capable). The
 // older callGemini/callGeminiVision keep their own request-building untouched —
 // every pre-embed task keeps its exact behaviour until it is retired.
-async function geminiGenerate(apiKey, contents) {
+async function geminiGenerate(apiKey, contents, model) {
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
@@ -591,9 +631,12 @@ async function doRunMethod(env, p) {
   // as recipe input (schemas stay small). Text-only methods are unchanged.
   const media = mediaFromPayload({ images: p && p.images });
   const apiKey = await geminiKey(env);
+  // The recipe pack carries no model of its own, so this is the caller's choice
+  // like every other task. Resolved once so the retry inside `ask` cannot drift.
+  const model = modelFor(p);
   const ask = (q) => media.length
-    ? callGeminiVision(apiKey, q, media, GEMINI_MODEL)
-    : callGemini(apiKey, q);
+    ? callGeminiVision(apiKey, q, media, model)
+    : callGemini(apiKey, q, model);
 
   let output = parseJson(await ask(prompt));
   let errs = validateOutput(output, pack.outputSchema);
@@ -757,18 +800,17 @@ function jsType(d) {
 // Exported for offline unit tests (node). Cloudflare only uses `export default`.
 export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
-         geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache };
+         geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
+         modelFor, GEMINI_MODEL, doClassify, doVisionOcr };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
 
-async function callGemini(apiKey, prompt) {
-  // Model: gemini-2.5-flash — stable, GA, broadly available on our key
-  // (gemini-3-flash 404s: "not found for API version v1beta"). Good reasoning
-  // for the extractAmount + runMethod analysis tasks; JSON response mode.
-  // Bump deliberately to a newer flash once confirmed available on the key.
+// model = the caller's choice, already resolved by modelFor(). Omitted falls
+// back to GEMINI_MODEL, which keeps every pre-v0.27 call site working untouched.
+async function callGemini(apiKey, prompt, model) {
   const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent' +
+    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
     '?key=' + encodeURIComponent(apiKey);
   const res = await fetch(url, {
     method: 'POST',
