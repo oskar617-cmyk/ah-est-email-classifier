@@ -119,8 +119,17 @@
 //           that says to reload the app. Requires ah-estimating v1.1.0+, which
 //           names one on every call including the "use the company key" case.
 //           Gemini key validation moved to models.list, so even that no longer
-//           needs a model id. (current)
-const VERSION = 'v0.30';
+//           needs a model id.
+//   v0.31 — the OTHER providers actually work now. Two things stopped them:
+//           modelFor judged EVERY id by Gemini's URL-path charset, so a
+//           namespaced id like "openai/gpt-oss-120b" was refused with advice to
+//           "send a plain Gemini model id"; and keyStatus answered for gemini
+//           alone, so each shared-key box showed a red "Only the gemini key
+//           lives here so far" above a box that would have taken a key. Model
+//           ids are now judged per provider (slashes are legal where the id
+//           travels in the JSON body, never where it goes in a URL), and
+//           keyStatus answers for every provider in KNOWN_PROVIDERS. (current)
+const VERSION = 'v0.31';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -134,11 +143,22 @@ const VERSION = 'v0.30';
 // choose is the failure this whole line of work exists to end.
 // See ah-estimating/docs/architecture.md, "模型与钥匙:一处设置,处处生效".
 //
-// Resolve the model for one request. The id is concatenated into the Gemini URL
-// PATH while the api key rides in the same URL's query string, so a `/`, `?` or
-// `#` smuggled in here would rewrite the request — hence the charset gate.
-const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
-function modelFor(p) {
+// Resolve the model for one request. WHAT IS LEGAL DEPENDS ON THE PROVIDER, and
+// getting that wrong is why Groq could not be called at all:
+//
+//   • Gemini — the id is concatenated into the URL PATH while the api key rides
+//     in that same URL's query string, so a `/`, `?` or `#` smuggled in would
+//     rewrite the request. Strict charset, no slash.
+//   • OpenAI-compatible (Groq, OpenRouter, Cerebras, DeepSeek, Mistral) — the id
+//     travels in the JSON BODY, where a slash cannot rewrite anything, and it is
+//     REQUIRED: their ids are namespaced ("openai/gpt-oss-120b",
+//     "qwen/qwen3.6-27b"). Applying Gemini's rule here refused every one of them
+//     — and told the user to "send a plain Gemini model id", which for a Groq
+//     model is advice that cannot be followed.
+const MODEL_ID_GEMINI = /^[A-Za-z0-9._-]{1,64}$/;
+const MODEL_ID_OPENAI = /^[A-Za-z0-9._\/-]{1,96}$/;
+function modelFor(p, provider) {
+  const prov = provider || 'gemini';
   let m = (p && typeof p.model === 'string') ? p.model.trim() : '';
   if (!m) {
     // Almost always an app build from before v1.1.0 still cached on a device.
@@ -146,9 +166,18 @@ function modelFor(p) {
     const e = new Error('This request did not say which model to run. Reload the app (Ctrl+Shift+R) so it picks up the current version — models are chosen in Settings now, not here.');
     e.status = 400; throw e;
   }
-  m = m.replace(/^models\//, '');   // Google's list API returns "models/<id>"
-  if (!MODEL_ID_RE.test(m)) {
-    const e = new Error(`Unknown model id "${m.slice(0, 60)}" — send a plain Gemini model id, e.g. gemini-3.1-flash-lite`);
+  // "models/<id>" is GOOGLE's list format. Stripping it from another provider's
+  // id would silently mangle a legitimate name.
+  if (prov === 'gemini') m = m.replace(/^models\//, '');
+  const ok = prov === 'gemini' ? MODEL_ID_GEMINI.test(m) : MODEL_ID_OPENAI.test(m);
+  if (!ok) {
+    // Describes the SHAPE, never an example model id: naming one here would put
+    // a model back in this file (see the header for why that is banned) and it
+    // would go stale the day that model is retired.
+    const shape = prov === 'gemini'
+      ? 'letters, numbers, dots, underscores and dashes only — no slashes, it goes into the request URL'
+      : 'letters, numbers, dots, dashes and slashes — these ids are usually vendor/model';
+    const e = new Error(`"${m.slice(0, 60)}" is not a usable ${prov} model id (${shape})`);
     e.status = 400; throw e;
   }
   return m;
@@ -451,7 +480,7 @@ let keyCache = { value: null, at: 0 };
 async function geminiKey(env) {
   if (keyCache.value && (Date.now() - keyCache.at) < KEY_CACHE_TTL_MS) return keyCache.value;
   const { value } = await geminiKeySource(env);
-  if (!value) throw new Error('The company Gemini key is not set — an admin can paste it in AH Estimating Settings (Model Connections)');
+  if (!value) throw new Error('The company Gemini key is not set — an admin can paste it in AH Estimating Settings → AI & Models');
   keyCache = { value, at: Date.now() };
   return value;
 }
@@ -504,7 +533,7 @@ async function providerKey(env, provider) {
   const rec = await readKeyRecord(env, provider);
   if (rec && rec.apiKey) return String(rec.apiKey);
   if (provider === 'gemini' && env && env.GEMINI_API_KEY) return env.GEMINI_API_KEY;
-  const e = new Error(`No ${provider} key is set — an admin can paste it in AH Estimating Settings (Model Connections)`);
+  const e = new Error(`No ${provider} key is set — an admin can paste it in AH Estimating Settings → AI & Models`);
   e.status = 400; throw e;
 }
 
@@ -606,7 +635,7 @@ async function doSetProviderKey(env, p, auth) {
     // an OpenAI-compatible provider has no single model every key can reach.
     // Without a model we can only check the shape, and say so rather than
     // pretend the key was proven.
-    else if (p && p.model) await callOpenAICompatible(provider, apiKey, String(p.model), 'Reply with the word ok.', null);
+    else if (p && p.model) await callOpenAICompatible(provider, apiKey, modelFor(p, provider), 'Reply with the word ok.', null);
     else if (apiKey.length < 20) { const e = new Error('That does not look like an API key'); e.status = 400; throw e; }
   } catch (err) {
     const e = new Error(`That key was rejected, so it was NOT saved — ${String((err && err.message) || 'the provider did not answer').slice(0, 300)}`);
@@ -622,12 +651,30 @@ async function doSetProviderKey(env, p, auth) {
 // keyStatus { provider? }: is a key configured and where would it come from.
 // last4/setBy/setAt come from the KV record only — the env secret is opaque
 // by design (nobody pasted it in the app, so there is nothing to attribute).
+// Answers for ANY provider this Worker can call. It used to refuse everything
+// but Gemini — left over from when Gemini was the only one — so the moment the
+// app grew a shared-key box for Groq and Cerebras, each one showed a red "Could
+// not check this key: Only the gemini key lives here so far" above a box that
+// would in fact have accepted a key perfectly well.
 async function doKeyStatus(env, p, auth) {
   requireValidTicket(auth);
   const provider = (p && p.provider) || 'gemini';
-  if (provider !== 'gemini') {
-    const e = new Error('Only the gemini key lives here so far');
+  if (!KNOWN_PROVIDERS.has(provider)) {
+    const e = new Error(`"${String(provider).slice(0, 40)}" is not a provider this Worker can call`);
     e.status = 400; throw e;
+  }
+  if (provider !== 'gemini') {
+    // No env-secret fallback for these: only Gemini has a deploy-time secret,
+    // so "configured" means a key was pasted into the app and nothing else.
+    const rec = await readKeyRecord(env, provider);
+    return {
+      provider,
+      configured: !!(rec && rec.apiKey),
+      source: (rec && rec.apiKey) ? 'app' : 'none',
+      last4: rec && rec.apiKey ? String(rec.apiKey).slice(-4) : '',
+      setBy: (rec && rec.setBy) || '',
+      setAt: (rec && rec.setAt) || ''
+    };
   }
   const { source, rec } = await geminiKeySource(env);
   return {
@@ -783,18 +830,22 @@ async function doRunPrompt(env, p) {
   const contents = contentsOf(p);
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
   const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
-  // Resolved ONCE: the validation retry below must go back to the SAME model.
-  // Retrying on a different one would mean the answer you finally get is not
-  // from the model you chose, which is the whole thing this release is ending.
-  const model = modelFor(p);
-  // Which company's model this is comes from the CALLER too. The app knows —
-  // it is the app's own setting — and guessing from the model id would be a
+  // Which company's model this is comes from the CALLER. The app knows — it is
+  // the app's own setting — and guessing from the model id would be a
   // naming-convention bet that breaks the first time somebody ships an id that
   // looks like somebody else's.
+  //
+  // 🔴 Resolved BEFORE the model: what counts as a valid model id depends on the
+  // provider (see modelFor). Doing it the other way round judged every id by
+  // Gemini's rules and refused every namespaced Groq/OpenRouter model.
   const provider = (p && typeof p.provider === 'string' && p.provider.trim()) || 'gemini';
   if (!KNOWN_PROVIDERS.has(provider)) {
     const e = new Error(`"${provider.slice(0, 40)}" is not a provider this Worker can call`); e.status = 400; throw e;
   }
+  // Resolved ONCE: the validation retry below must go back to the SAME model.
+  // Retrying on a different one would mean the answer you finally get is not
+  // from the model you chose, which is the whole thing this release is ending.
+  const model = modelFor(p, provider);
   if (provider !== 'gemini') {
     // One shot, no schema retry: the OpenAI-compatible path has no equivalent
     // of Gemini's JSON mode here, so a schema failure is reported honestly

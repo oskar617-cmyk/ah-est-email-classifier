@@ -154,8 +154,32 @@ ok(st.configured === false && st.source === 'none' && st.last4 === '',
   'keyStatus source=none when there is no key anywhere');
 await throws(() => doKeyStatus(env, {}, authNone), /ticket is missing/,
   'keyStatus also demands a valid ticket, even in soft mode');
-await throws(() => doKeyStatus(env, { provider: 'openai' }, authUser), /Only the gemini key lives here/,
-  'keyStatus still answers for gemini only - it reports the deploy-time secret fallback, which no other provider has');
+// ---- (g) 🔴 keyStatus answers for EVERY provider this Worker can call -------
+// It used to refuse everything but Gemini. The moment the app grew a shared-key
+// box for Groq and Cerebras (v1.2.0), each one showed a red "Could not check
+// this key: Only the gemini key lives here so far" above a box that would have
+// taken a key perfectly well (Oskar 2026-08-06: "后面两个无法连接api").
+// A Worker WITHOUT this fix throws here instead of answering. Catch it so the
+// file still prints a total: a crash reads the same as a clean run to anything
+// checking the last line.
+const statusOf = async (e, p_) => { try { return await doKeyStatus(e, p_, authUser); } catch (err) { return { error: err.message }; } };
+store['provider-key:groq'] = JSON.stringify({ apiKey: 'gsk_liveLookingKey1234', setBy: 'oskar@auhs.com.au', setAt: '2026-08-06T00:00:00.000Z' });
+st = await statusOf(env, { provider: 'groq' });
+ok(st.provider === 'groq' && st.configured === true && st.source === 'app' && st.last4 === '1234',
+  'keyStatus answers for groq, from that provider\'s own KV record');
+ok(!JSON.stringify(st).includes('gsk_liveLookingKey1234'), 'and never leaks that key either');
+st = await statusOf(env, { provider: 'cerebras' });
+ok(st.configured === false && st.source === 'none' && st.last4 === '',
+  'a provider with no key saved reports none - not an error');
+// The deploy-time secret is Gemini's alone: another provider must never inherit
+// it and claim to be configured when nothing was ever pasted for it.
+st = await statusOf({ ...env, GEMINI_API_KEY: 'env-secret-key' }, { provider: 'cerebras' });
+ok(st.configured === false && st.source === 'none',
+  'and it does NOT pick up the Gemini deploy-time secret');
+await throws(() => doKeyStatus(env, { provider: 'openai' }, authUser), /is not a provider this Worker can call/,
+  'a provider this Worker cannot call is still refused, by name');
+await throws(() => doKeyStatus(env, { provider: 'nonsense' }, authUser), /is not a provider this Worker can call/,
+  'and so is anything unrecognised');
 
 globalThis.fetch = realFetch;
 console.log(`\nkeys: ${pass} pass, ${fail} fail`);

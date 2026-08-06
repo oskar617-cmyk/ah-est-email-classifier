@@ -81,7 +81,7 @@ eq(modelFor({ model: 'models/gemini-3.7-flash' }), 'gemini-3.7-flash', 'the mode
 // 🔴 The id lands in the URL PATH while the api key rides in the same URL's
 // query string, so a smuggled separator would rewrite the request.
 for (const bad of ['a/../b', 'x?key=stolen', 'y#frag', 'a b', 'a&b=1', '../../etc', 'x'.repeat(65)]) {
-  await throws(async () => modelFor({ model: bad }), /Unknown model id/, `"${bad}" is refused, not passed into the URL`);
+  await throws(async () => modelFor({ model: bad }), /not a usable/, `"${bad}" is refused, not passed into the URL`);
 }
 // And refused LOUDLY — never quietly swapped for the default.
 try { modelFor({ model: 'x?key=stolen' }); } catch (e) {
@@ -126,9 +126,49 @@ ok(out.outputValid === true, 'and the corrected answer is accepted');
 
 // ---- 4. a bad id stops the call, it does not downgrade it -------------------
 reset('{"ok":true}');
-await throws(() => doRunPrompt(ENV, { prompt: 'hi', model: 'gemini/../evil' }), /Unknown model id/,
+await throws(() => doRunPrompt(ENV, { prompt: 'hi', model: 'gemini/../evil' }), /not a usable/,
   'runPrompt refuses a malformed id');
 eq(urls.length, 0, 'and nothing was sent to Google at all');
+
+// ---- 4b. 🔴 a provider's model id is judged by THAT provider's rules --------
+// Oskar 2026-08-06: "后面两个无法连接api". Groq and Cerebras could not be called at
+// all. modelFor applied Gemini's URL-path charset (no slash) to every provider,
+// but OpenAI-compatible ids are namespaced -- and theirs travel in the JSON
+// BODY, where a slash cannot rewrite anything. Every Groq model was refused,
+// with a message telling the user to send a Gemini id instead.
+// eqSafe, not eq: on a Worker WITHOUT this fix modelFor throws here, and a
+// thrown error would take the whole file down before it printed a total — which
+// reads exactly like a clean run to anything checking the last line.
+const eqSafe = (fn, want, msg) => {
+  let got; try { got = fn(); } catch (e) { got = `threw: ${e.message}`; }
+  eq(got, want, msg);
+};
+for (const id of ['openai/gpt-oss-120b', 'qwen/qwen3.6-27b', 'meta-llama/llama-4-scout-17b']) {
+  eqSafe(() => modelFor({ model: id }, 'groq'), id, `"${id}" is accepted for an OpenAI-compatible provider`);
+  await throws(async () => modelFor({ model: id }, 'gemini'), /not a usable gemini model id/,
+    `and still refused for GEMINI, where it would rewrite the URL`);
+}
+// The slash is the only relaxation. Anything that could still break a request stays out.
+for (const bad of ['x?key=stolen', 'y#frag', 'a b', 'a&b=1', 'x'.repeat(97)]) {
+  await throws(async () => modelFor({ model: bad }, 'groq'), /not a usable groq model id/,
+    `"${bad}" is refused for groq too`);
+}
+// And the advice names the right provider — "send a plain Gemini model id" is
+// not something you can act on when you are choosing a Groq model.
+try { modelFor({ model: 'a b' }, 'groq'); } catch (e) {
+  ok(/groq/.test(e.message) && !/Gemini model id/.test(e.message),
+    'the error names the provider you were actually using');
+  ok(/vendor\/model/.test(e.message), 'and describes the right shape');
+  ok(!/gemini-[0-9]/.test(e.message), 'without naming a model id — that would put one back in the Worker');
+}
+// "models/" is Google's list format; stripping it elsewhere would mangle a name.
+eqSafe(() => modelFor({ model: 'models/foo' }, 'groq'), 'models/foo', 'the Google prefix is not stripped from other providers');
+
+// ---- 4c. end to end: a Groq call is not judged by Gemini's rules ------------
+reset('{"ok":true}');
+await run(() => doRunPrompt(ENV, { prompt: 'hi', model: 'openai/gpt-oss-120b', provider: 'groq' }), 'groq runPrompt');
+ok(urls.length === 1, 'a Groq request actually goes out');
+ok(!/generativelanguage/.test(urls[0] || ''), 'and not to Google');
 
 // ---- 5. checking a KEY needs no model ---------------------------------------
 // This is what let the constant go. Saving a key used to require picking a model
