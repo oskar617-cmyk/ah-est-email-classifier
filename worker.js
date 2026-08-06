@@ -113,35 +113,54 @@
 //           (provider-key:<name>) and validates it with a real call. runPrompt
 //           routes on the provider the CALLER names: guessing it from the model
 //           id would be a naming-convention bet. KNOWN_PROVIDERS here and
-//           WORKER_PROVIDERS in the app must stay identical. (current)
-const VERSION = 'v0.29';
+//           WORKER_PROVIDERS in the app must stay identical.
+//   v0.30 — NO MODEL IS NAMED IN THIS FILE ANY MORE. The v0.27 fallback constant
+//           is deleted: a generating request must carry a model or it is a 400
+//           that says to reload the app. Requires ah-estimating v1.1.0+, which
+//           names one on every call including the "use the company key" case.
+//           Gemini key validation moved to models.list, so even that no longer
+//           needs a model id. (current)
+const VERSION = 'v0.30';
 
-// DEFAULT model — used only when the caller does not name one (see modelFor).
-// gemini-2.5-flash's free tier is only 250 requests/day, too small for bulk
-// folder scans; gemini-3.1-flash-lite has a much larger free allowance and
-// still does vision + strict-JSON output.
-// (NB: the id "gemini-3-flash" 404s — it doesn't exist; the real ids are
-// gemini-3.1-flash-lite / gemini-3-flash-preview.)
+// THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
+// 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
+// cannot see and cannot change, and that is exactly what pinned the whole app to
+// gemini-3.1-flash-lite for months while the settings screen said otherwise.
 //
-// This constant is a TRANSITION fallback, not a choice. Which model runs is the
-// app owner's setting, and hardcoding it here is exactly what pinned the whole
-// app to 3.1 for months. It is deleted once the app sends a model on every
-// call. See ah-estimating/docs/architecture.md, "模型与钥匙:一处设置,处处生效".
-const GEMINI_MODEL = 'gemini-3.1-flash-lite';
-
+// Which model runs is the APP's setting now, sent on every generating request
+// (ah-estimating js/model-catalog.js BUILTIN_MODEL_RUNS covers the "just use the
+// company key" case). A request that names none is a 400 with an explanation —
+// never a quiet substitution, because being answered by a model you did not
+// choose is the failure this whole line of work exists to end.
+// See ah-estimating/docs/architecture.md, "模型与钥匙:一处设置,处处生效".
+//
 // Resolve the model for one request. The id is concatenated into the Gemini URL
 // PATH while the api key rides in the same URL's query string, so a `/`, `?` or
 // `#` smuggled in here would rewrite the request — hence the charset gate.
 const MODEL_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 function modelFor(p) {
   let m = (p && typeof p.model === 'string') ? p.model.trim() : '';
-  if (!m) return GEMINI_MODEL;
+  if (!m) {
+    // Almost always an app build from before v1.1.0 still cached on a device.
+    // Say that, rather than "bad request": the fix is a reload, not a bug report.
+    const e = new Error('This request did not say which model to run. Reload the app (Ctrl+Shift+R) so it picks up the current version — models are chosen in Settings now, not here.');
+    e.status = 400; throw e;
+  }
   m = m.replace(/^models\//, '');   // Google's list API returns "models/<id>"
   if (!MODEL_ID_RE.test(m)) {
     const e = new Error(`Unknown model id "${m.slice(0, 60)}" — send a plain Gemini model id, e.g. gemini-3.1-flash-lite`);
     e.status = 400; throw e;
   }
   return m;
+}
+
+// One place that builds a Gemini generateContent URL, so no call site can quietly
+// go model-less: an absent model throws here instead of producing ".../models/:generateContent".
+function geminiUrl(model, apiKey) {
+  const m = String(model || '').trim();
+  if (!m) throw new Error('Internal: a Gemini call was made without a model. The caller must name one.');
+  return 'https://generativelanguage.googleapis.com/v1beta/models/' + m + ':generateContent'
+    + '?key=' + encodeURIComponent(apiKey);
 }
 
 import { FIXTURES } from './fixtures.js';
@@ -570,18 +589,19 @@ async function doSetProviderKey(env, p, auth) {
     e.status = 400; throw e;
   }
   if (!env.KEYS) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
-  // Validate BEFORE storing: one tiny real Gemini call with the CANDIDATE
-  // key. A typo'd key must never replace a working one, and the admin should
-  // see Gemini's actual reason, not a generic "failed".
+  // Validate BEFORE storing: one real call with the CANDIDATE key. A typo'd key
+  // must never replace a working one, and the admin should see the provider's
+  // actual reason, not a generic "failed".
   //
-  // DELIBERATELY on the fixed default model, not modelFor(p) — do not "finish
-  // the job" by threading the caller's model in here. This call tests the KEY.
-  // On a model the key has no access to it would 404, the catch below would
-  // report "That key was rejected", and a perfectly good key could never be
-  // rotated in. Gemini's own words are passed through, so an admin can still
-  // tell "model not found" from "API key not valid".
+  // For Gemini that call is models.list, NOT a generation. It tests the KEY,
+  // which is the only thing being saved here, and it needs no model id — so
+  // there is nothing to hardcode and nothing to inherit from the caller. (Using
+  // a generation would mean picking a model: on one the key cannot reach it 404s,
+  // the catch below reports "that key was rejected", and a perfectly good key
+  // could never be rotated in.) Google's own words are passed through, so an
+  // admin can still tell "API key not valid" from anything else.
   try {
-    if (provider === 'gemini') await callGemini(apiKey, 'Return exactly this JSON: {"ok":true}');
+    if (provider === 'gemini') await validateGeminiKey(apiKey);
     // Same rule for the others: a real call, on a model the CALLER named, since
     // an OpenAI-compatible provider has no single model every key can reach.
     // Without a model we can only check the shape, and say so rather than
@@ -683,6 +703,24 @@ async function doListModels(env) {
     if (!pageToken) break;
   }
   return { models: out, fetchedAt: new Date().toISOString() };
+}
+
+// Is this key real? Asks Google to list the models the key can see — the same
+// endpoint as above, but with a CANDIDATE key rather than the stored one, and
+// only the verdict matters. Throws with Google's own message when it does not.
+async function validateGeminiKey(apiKey) {
+  let res;
+  try { res = await fetch(`${GOOGLE_MODELS_URL}?pageSize=1`, { headers: { 'x-goog-api-key': apiKey } }); }
+  catch (err) { throw new Error(`could not reach Google to check it: ${(err && err.message) || 'no answer'}`); }
+  if (res.ok) return true;
+  // Read it as TEXT and then try to parse. A refusal is not always JSON — an
+  // edge/proxy error is often HTML, and res.json() would throw on it, replacing
+  // Google's actual reason with a parser message.
+  let raw = '';
+  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
+  let msg = '';
+  try { msg = (JSON.parse(raw).error || {}).message || ''; } catch { /* not JSON */ }
+  throw new Error(msg || raw.slice(0, 200) || `Google answered HTTP ${res.status}`);
 }
 
 // ---------- the app's Vaenyx relay key ----------
@@ -812,9 +850,7 @@ function contentsOf(p) {
 // older callGemini/callGeminiVision keep their own request-building untouched —
 // every pre-embed task keeps its exact behaviour until it is retired.
 async function geminiGenerate(apiKey, contents, model) {
-  const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
-    '?key=' + encodeURIComponent(apiKey);
+  const url = geminiUrl(model, apiKey);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1020,19 +1056,17 @@ function jsType(d) {
 export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
          geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
-         modelFor, GEMINI_MODEL, doClassify, doVisionOcr,
-         doListModels, doGetRelayKey, doSetRelayKey,
+         modelFor, geminiUrl, doClassify, doVisionOcr,
+         doListModels, validateGeminiKey, doGetRelayKey, doSetRelayKey,
          callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
 
-// model = the caller's choice, already resolved by modelFor(). Omitted falls
-// back to GEMINI_MODEL, which keeps every pre-v0.27 call site working untouched.
+// model = the caller's choice, already resolved by modelFor(). It is REQUIRED:
+// there is no default left in this file to fall back to.
 async function callGemini(apiKey, prompt, model) {
-  const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
-    '?key=' + encodeURIComponent(apiKey);
+  const url = geminiUrl(model, apiKey);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1062,9 +1096,7 @@ async function callGeminiVision(apiKey, prompt, media, model) {
   for (const m of (Array.isArray(media) ? media : [])) {
     if (m && m.data) parts.push({ inline_data: { mime_type: m.mimeType || 'application/pdf', data: m.data } });
   }
-  const url =
-    'https://generativelanguage.googleapis.com/v1beta/models/' + (model || GEMINI_MODEL) + ':generateContent' +
-    '?key=' + encodeURIComponent(apiKey);
+  const url = geminiUrl(model, apiKey);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

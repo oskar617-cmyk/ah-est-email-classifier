@@ -86,18 +86,23 @@ ok(c.length === 3 && c[2].parts.length === 2 && c[2].parts[1].inline_data.data =
 ok(contentsOf({}) === null && contentsOf({ messages: [] }) === null, 'no prompt and no messages -> null (400 upstream)');
 
 // ---- doRunPrompt: schema validate + one retry ----
+// These are about SCHEMA handling, not model choice — but from Worker v0.30 a
+// generating call must name a model (there is no default left in the Worker),
+// so they name one and then ignore it. That rule has its own tests in
+// test/model.test.mjs.
+const MODEL = 'gemini-3.7-flash';
 const schema = { type: 'object', required: ['kind'], properties: { kind: { type: 'string', enum: ['a', 'b'] } } };
 geminiAnswers = ['{"kind":"a"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema });
+r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
 ok(r.output && r.output.kind === 'a' && r.outputValid === true, 'valid first answer -> outputValid true');
 geminiAnswers = ['{"kind":"zzz"}', '{"kind":"b"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema });
+r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
 ok(r.output && r.output.kind === 'b' && r.outputValid === true, 'a bad first answer is retried once and corrected');
 geminiAnswers = ['{"kind":"zzz"}', '{"kind":"zzz"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema });
+r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
 ok(r.outputValid === false && r.output, 'twice-bad -> outputValid false, output still returned for review');
 geminiAnswers = ['{"anything":1}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p' });
+r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', model: MODEL });
 ok(r.output && r.output.anything === 1 && r.raw === '{"anything":1}' && !('outputValid' in r), 'no schema -> raw passthrough, no fake outputValid');
 await throws(() => doRunPrompt({ GEMINI_API_KEY: 'k' }, {}), /prompt or messages required/, 'empty payload -> 400');
 
