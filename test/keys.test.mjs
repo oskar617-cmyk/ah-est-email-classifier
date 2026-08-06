@@ -37,7 +37,7 @@ const ticketFor = email => mint({ iss: ISS, tid: TID, aud: AUD, exp: now + 3600,
 
 // ---- stub KV + outbound fetch (JWKS -> our key, Gemini -> scripted) ----
 const store = {};
-const KEYS = { get: async k => store[k] ?? null, put: async (k, v) => { store[k] = v; } };
+const KEYS = { get: async k => store[k] ?? null, put: async (k, v) => { store[k] = v; }, delete: async k => { delete store[k]; } };
 
 // geminiScript entries: { ok:true, text } (an answer) or { ok:false, status, body }.
 let geminiScript = [];
@@ -180,6 +180,31 @@ await throws(() => doKeyStatus(env, { provider: 'openai' }, authUser), /is not a
   'a provider this Worker cannot call is still refused, by name');
 await throws(() => doKeyStatus(env, { provider: 'nonsense' }, authUser), /is not a provider this Worker can call/,
   'and so is anything unrecognised');
+
+// ---- (h) 🔴 forgetting a key you no longer use -----------------------------
+// There was no way to remove a stored key at all: an unused provider key sat on
+// the server for ever. Clearing is an EXPLICIT flag, never "empty apiKey means
+// delete" — a mis-wired form posting '' would otherwise wipe the company key
+// and stop every computer at once.
+store['provider-key:groq'] = JSON.stringify({ apiKey: 'gsk_stillHereForNow123', setBy: 'oskar@auhs.com.au', setAt: '2026-08-06T00:00:00.000Z' });
+const cleared = await doSetProviderKey(env, { provider: 'groq', clear: true }, authAdmin);
+ok(cleared.ok === true && cleared.cleared === true && cleared.provider === 'groq', 'clear reports what it did');
+ok(store['provider-key:groq'] === undefined, 'and the record is really gone from the store');
+st = await statusOf(env, { provider: 'groq' });
+ok(st.configured === false && st.source === 'none', 'keyStatus agrees straight afterwards');
+// An empty paste must NOT be read as "delete".
+store['provider-key:groq'] = JSON.stringify({ apiKey: 'gsk_mustSurviveThis1234', setBy: 'x', setAt: 'x' });
+await throws(() => doSetProviderKey(env, { provider: 'groq', apiKey: '' }, authAdmin),
+  /does not look like an API key/, 'an EMPTY apiKey is refused, not treated as a delete');
+ok(JSON.parse(store['provider-key:groq']).apiKey === 'gsk_mustSurviveThis1234', 'and the stored key survives it');
+// Forgetting is a key-admin action like setting one.
+await throws(() => doSetProviderKey(env, { provider: 'groq', clear: true }, authUser),
+  /key admin/, 'a non-admin cannot forget a key either');
+await throws(() => doSetProviderKey(env, { provider: 'groq', clear: true }, authNone),
+  /ticket is missing/, 'nor can a ticketless caller');
+ok(JSON.parse(store['provider-key:groq']).apiKey === 'gsk_mustSurviveThis1234', 'both refusals left the key alone');
+await throws(() => doSetProviderKey(env, { provider: 'openai', clear: true }, authAdmin),
+  /not a provider this Worker can call/, 'and an unknown provider is still refused on the clear path');
 
 globalThis.fetch = realFetch;
 console.log(`\nkeys: ${pass} pass, ${fail} fail`);

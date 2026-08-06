@@ -128,8 +128,16 @@
 //           lives here so far" above a box that would have taken a key. Model
 //           ids are now judged per provider (slashes are legal where the id
 //           travels in the JSON body, never where it goes in a URL), and
-//           keyStatus answers for every provider in KNOWN_PROVIDERS. (current)
-const VERSION = 'v0.31';
+//           keyStatus answers for every provider in KNOWN_PROVIDERS.
+//   v0.31.1 — a refusal that is not JSON keeps its words: the body is read once
+//           as text and parsed after, so an edge page or a bare status no longer
+//           replaces the provider's reason with a naked "HTTP 402".
+//   v0.32 — setProviderKey { clear: true } FORGETS a stored key. Until now one
+//           could be replaced but never removed, so a key you had stopped using
+//           sat in KV for ever. Clearing is an explicit flag, never "an empty
+//           apiKey means delete" -- that would let a mis-wired form wipe the
+//           company key and stop every computer at once. (current)
+const VERSION = 'v0.32';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -613,6 +621,13 @@ function requireValidTicket(auth) {
 }
 
 // setProviderKey { provider, apiKey }: store/rotate the company key.
+// setProviderKey { provider, clear: true }: FORGET it — a key you have stopped
+// using should not sit on the server indefinitely, and until now there was no
+// way to remove one at all.
+//
+// Clearing is an EXPLICIT flag, never "an empty apiKey means delete": a bug or
+// a mis-wired form that posted an empty string would then silently wipe the
+// company key, and every computer would stop working at once.
 // KEY_ADMINS is a second, smaller list on top of EMAIL_ALLOWLIST — using the
 // AI is not the same privilege as changing its key.
 async function doSetProviderKey(env, p, auth) {
@@ -627,6 +642,12 @@ async function doSetProviderKey(env, p, auth) {
     const e = new Error(`"${String(provider).slice(0, 40)}" is not a provider this Worker can call — it speaks ${[...KNOWN_PROVIDERS].join(', ')}`);
     e.status = 400; throw e;
   }
+  if (!env.KEYS) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
+  if (p && p.clear === true) {
+    await env.KEYS.delete(kvKeyFor(provider));
+    if (provider === 'gemini') bustKeyCache();
+    return { ok: true, provider, cleared: true };
+  }
   const apiKey = (p && typeof p.apiKey === 'string') ? p.apiKey.trim() : '';
   // Plausibility only — the REAL check is the live Gemini call below. This
   // just catches an empty paste or a key chopped by a line break.
@@ -634,7 +655,6 @@ async function doSetProviderKey(env, p, auth) {
     const e = new Error('That does not look like an API key — paste the whole key, with no spaces');
     e.status = 400; throw e;
   }
-  if (!env.KEYS) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
   // Validate BEFORE storing: one real call with the CANDIDATE key. A typo'd key
   // must never replace a working one, and the admin should see the provider's
   // actual reason, not a generic "failed".
