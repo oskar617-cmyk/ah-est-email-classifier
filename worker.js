@@ -98,8 +98,16 @@
 //           downgrade to the default — being answered by a model you did not
 //           choose is the failure this whole change exists to end. The
 //           key-validation call in setProviderKey deliberately stays on the
-//           fixed default: it validates the KEY, not the model. (current)
-const VERSION = 'v0.27';
+//           fixed default: it validates the KEY, not the model.
+//   v0.28 — three tasks, all in service of "set it once, every device has it":
+//           listModels (Google's OWN catalogue for this key, so a new Gemini
+//           turns up in the dropdown by itself — capability is deliberately NOT
+//           read from it), and getRelayKey / setRelayKey, which keep the app's
+//           Vaenyx key in KV so each signed-in browser collects it instead of
+//           being pasted into. That key is the one credential meant to reach a
+//           browser: only a browser can be on the tailnet Vaenyx lives on.
+//           (current)
+const VERSION = 'v0.28';
 
 // DEFAULT model — used only when the caller does not name one (see modelFor).
 // gemini-2.5-flash's free tier is only 250 requests/day, too small for bulk
@@ -204,6 +212,9 @@ export default {
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
       else if (task === 'setProviderKey')    result = await doSetProviderKey(env, payload, auth);
       else if (task === 'keyStatus')         result = await doKeyStatus(env, payload, auth);
+      else if (task === 'listModels')        result = await doListModels(env);
+      else if (task === 'getRelayKey')       result = await doGetRelayKey(env, payload, auth);
+      else if (task === 'setRelayKey')       result = await doSetRelayKey(env, payload, auth);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
       return jsonResponse({ result }, 200, corsHeaders);
     } catch (err) {
@@ -539,6 +550,112 @@ async function doKeyStatus(env, p, auth) {
 //                   schemas inside that subset, never lean on unknown keywords)
 // returns: { output, outputValid }           with a schema
 //          { output, raw }                   without one (output = best-effort JSON)
+// ---------- listModels: ask GOOGLE what exists, not an AI ----------
+//
+// The app's "Survey Free Models" button asks a model to name free models, and
+// models confidently invent them — which is why the shared rule says a survey
+// may only add NAMES and never decide capability. This is a different thing
+// entirely: Google's own catalogue for this key. When Google ships 3.7 it turns
+// up here by itself, and Oskar picks it deliberately (his call 2026-08-06: no
+// floating "-latest" alias, "just in case the newest has problems").
+//
+// 🔴 Capability is NOT in this answer. Model carries supportedGenerationMethods
+// (which METHOD you may call), never "can it read pictures" — a text-only model
+// and a vision model both say generateContent. Do not try to light up Image In
+// from this; that stays with the app's local table or a real probe.
+const GOOGLE_MODELS_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+async function doListModels(env) {
+  const apiKey = await geminiKey(env);
+  const out = [];
+  let pageToken = '';
+  // Default page size is 50 and Google is well past that (every -001/-002
+  // variant, embeddings, imagen, veo, tts). Asking for 50 silently truncates
+  // the list, which reads as "the API is broken" rather than "page 2 exists".
+  for (let page = 0; page < 6; page++) {
+    const url = `${GOOGLE_MODELS_URL}?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+    let res;
+    // The key goes in a HEADER, not the query string: a URL carries into logs,
+    // history and referrers, and this one is the company's.
+    try { res = await fetch(url, { headers: { 'x-goog-api-key': apiKey } }); }
+    catch (err) { const e = new Error(`Could not reach Google to list models: ${err && err.message}`); e.status = 502; throw e; }
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const why = (body && body.error && body.error.message) || `HTTP ${res.status}`;
+      const e = new Error(`Google refused the model list — ${why}`); e.status = res.status; throw e;
+    }
+    for (const m of ((body && body.models) || [])) {
+      // Only things you can actually hold a conversation with. Without this the
+      // dropdown fills up with embedding, image and speech models.
+      if (!((m.supportedGenerationMethods || []).includes('generateContent'))) continue;
+      const id = String(m.name || '').replace(/^models\//, '');
+      if (!id) continue;
+      // Every field but the id is optional — a missing displayName must never
+      // drop the model, only fall back to its id.
+      out.push({ id, label: m.displayName || id, description: m.description || '',
+        inputTokenLimit: m.inputTokenLimit || null });
+    }
+    pageToken = (body && body.nextPageToken) || '';
+    if (!pageToken) break;
+  }
+  return { models: out, fetchedAt: new Date().toISOString() };
+}
+
+// ---------- the app's Vaenyx relay key ----------
+//
+// This is the ONE credential that is meant to reach the browser, and the reason
+// is physical: Vaenyx lives on Oskar's Tailscale network and only a browser can
+// be on that network — Cloudflare never can. So the Worker cannot use this key
+// itself; it can only keep it somewhere every signed-in device can collect it,
+// which is what turns "paste it on each computer" into "paste it once".
+//
+// ⚠️ Do not "fix" this to match the provider keys, which must never leave. It
+// is not a model key; it is a channel identity, and the browser has always held
+// it. What this adds is one copy instead of N.
+//
+// The gate is the sign-in ticket — hard, even while REQUIRE_AUTH is soft, since
+// a ticketless caller must never be handed a credential. Its blast radius is
+// therefore exactly EMAIL_ALLOWLIST: widening that list now widens this key too.
+const KV_KEY_RELAY = 'relay-key:vaenyx';
+async function doGetRelayKey(env, p, auth) {
+  requireValidTicket(auth);
+  if (!(env && env.KEYS)) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
+  let raw = null;
+  try { raw = await env.KEYS.get(KV_KEY_RELAY); } catch (e) { /* treated as absent */ }
+  let rec = null;
+  try { rec = raw ? JSON.parse(raw) : null; } catch (e) { rec = null; }
+  const token = (rec && rec.token) ? String(rec.token) : '';
+  // Absent is not an error: most of the time there simply is no shared key yet,
+  // and the app falls back to whatever this browser has.
+  return { token, setBy: (rec && rec.setBy) || '', setAt: (rec && rec.setAt) || '' };
+}
+
+// setRelayKey { token }: store/rotate it. Admin-only, like the provider keys —
+// handing out a credential is a bigger privilege than using one.
+async function doSetRelayKey(env, p, auth) {
+  requireValidTicket(auth);
+  const admins = parseAllowed(env.KEY_ADMINS || '').map(x => x.toLowerCase());
+  if (!admins.includes(auth.email)) {
+    const e = new Error(`Only a key admin can change the Vaenyx key — this account (${auth.email}) is not on the admin list`);
+    e.status = 403; throw e;
+  }
+  if (!(env && env.KEYS)) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
+  const token = (p && typeof p.token === 'string') ? p.token.trim() : '';
+  if (!token) {                       // empty clears it
+    await env.KEYS.delete(KV_KEY_RELAY);
+    return { ok: true, cleared: true };
+  }
+  // Shape check only. The real test is a call to Vaenyx, and this Worker cannot
+  // make one — the Mini PC is on a tailnet Cloudflare cannot reach. So the app
+  // tests it from the browser; refusing an obviously wrong paste here is all
+  // that is honest from this side.
+  if (!/^vaenyx_app_/.test(token) || /\s/.test(token) || token.length < 20) {
+    const e = new Error('That does not look like this app\'s relay key — it starts with vaenyx_app_ and comes from Vaenyx\'s Subscription Door panel');
+    e.status = 400; throw e;
+  }
+  await env.KEYS.put(KV_KEY_RELAY, JSON.stringify({ token, setBy: auth.email, setAt: new Date().toISOString() }));
+  return { ok: true, last4: token.slice(-4), setBy: auth.email };
+}
+
 async function doRunPrompt(env, p) {
   const contents = contentsOf(p);
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
@@ -801,7 +918,8 @@ function jsType(d) {
 export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
          geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
-         modelFor, GEMINI_MODEL, doClassify, doVisionOcr };
+         modelFor, GEMINI_MODEL, doClassify, doVisionOcr,
+         doListModels, doGetRelayKey, doSetRelayKey };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.
