@@ -568,12 +568,29 @@ async function callOpenAICompatible(provider, apiKey, model, prompt, media) {
   } catch (err) {
     const e = new Error(`${cfg.label} could not be reached: ${err && err.message}`); e.status = 502; throw e;
   }
-  const body = await res.json().catch(() => null);
+  // Read the body ONCE as text, then try to parse. res.json() on a refusal that
+  // is not JSON (an edge/proxy page, a bare status) threw, got swallowed by the
+  // .catch, and left `null` — so the provider's actual reason was replaced by a
+  // bare "HTTP 402", which tells you nothing you can act on.
+  let raw = '';
+  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
+  let body = null;
+  try { body = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
   if (!res.ok) {
     // The provider's OWN words. A generic "call failed" costs an hour of
     // guessing at which of the key, the model id or the quota is wrong.
-    const why = (body && body.error && (body.error.message || body.error)) || `HTTP ${res.status}`;
-    const e = new Error(`${cfg.label} refused: ${String(why).slice(0, 300)}`); e.status = res.status; throw e;
+    const said = (body && body.error && (body.error.message || body.error))
+      || (body && (body.message || body.detail))
+      || raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    // What the STATUS means, when the body says nothing useful. These are the
+    // HTTP meanings, not a claim about the account — a bare number is useless to
+    // whoever is holding the key and wondering what to fix.
+    const meaning = { 401: 'the key was not accepted', 402: 'payment required — that account needs billing or credits set up',
+      403: 'the key is valid but not allowed to do this', 404: 'no such model on this account',
+      429: 'rate limit or free quota reached' }[res.status];
+    const why = said ? String(said).slice(0, 300) : (meaning ? `HTTP ${res.status} — ${meaning}` : `HTTP ${res.status}`);
+    const suffix = (said && meaning) ? ` (HTTP ${res.status} — ${meaning})` : '';
+    const e = new Error(`${cfg.label} refused: ${why}${suffix}`); e.status = res.status; throw e;
   }
   const text = body && body.choices && body.choices[0] && body.choices[0].message
     ? body.choices[0].message.content : '';

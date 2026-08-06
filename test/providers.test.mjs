@@ -35,8 +35,17 @@ let sent = [], answer = null;
 globalThis.fetch = async (url, init) => {
   sent.push({ url: String(url), init, body: JSON.parse((init && init.body) || '{}') });
   if (typeof answer === 'function') return answer();
-  return { ok: true, status: 200, json: async () => answer };
+  return resp(true, 200, answer);
 };
+// A real Response exposes BOTH json() and text(), and the Worker reads the body
+// as TEXT so a refusal that is not JSON keeps the provider's own words. A stub
+// with json() only made that look like a regression.
+const resp = (ok, status, obj) => ({
+  ok, status,
+  json: async () => obj,
+  text: async () => JSON.stringify(obj)
+});
+
 const reply = txt => ({ choices: [{ message: { content: txt } }] });
 const store = { 'provider-key:groq': JSON.stringify({ apiKey: 'gsk-live' }) };
 const ENV = { KEYS: { get: async k => store[k] ?? null, put: async (k, v) => { store[k] = v; }, delete: async k => { delete store[k]; } } };
@@ -63,17 +72,37 @@ ok(/^data:image\/png;base64,AAAA$/.test(parts[1].image_url.url), 'as a data url 
 
 // ---- 2. 🔴 a refusal arrives in the provider's own words -------------------
 reset(null);
-globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: 'Invalid API Key' } }) });
+globalThis.fetch = async () => resp(false, 401, { error: { message: 'Invalid API Key' } });
 await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Invalid API Key/,
   'the provider says why — "call failed" costs an hour guessing between key, model and quota');
 await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Groq/, 'and it says WHICH provider');
 globalThis.fetch = async () => { throw new Error('dns go boom'); };
 await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /could not be reached/, 'unreachable is its own answer');
 
+// ---- 2b. 🔴 a refusal that is NOT JSON still says something useful ----------
+// Oskar 2026-08-06: a brand new Cerebras key came back as a bare "HTTP 402".
+// res.json() threw on that body, the .catch swallowed it, and the provider's
+// reason was replaced by the status number — which tells you nothing to fix.
+const textResp = (status, s) => ({ ok: false, status, json: async () => { throw new Error('not json'); }, text: async () => s });
+globalThis.fetch = async () => textResp(402, '<html><body>Payment Required</body></html>');
+await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /Payment Required/,
+  'an HTML refusal is stripped to its words instead of being dropped');
+globalThis.fetch = async () => textResp(402, '');
+await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /billing or credits/,
+  'and an EMPTY refusal at least explains what that status number means');
+await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /402/, 'without hiding the number itself');
+globalThis.fetch = async () => textResp(429, '');
+await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /rate limit or free quota/,
+  '429 is named too — the one people hit weekly');
+// A body that DOES say something must win over our generic explanation.
+globalThis.fetch = async () => resp(false, 402, { error: { message: 'Add a payment method to continue' } });
+await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /Add a payment method to continue/,
+  'the provider\'s own words come first when there are any');
+
 // ---- 3. 🔴 the two lists must not drift ------------------------------------
 // The app routes a job here from its OWN list of providers. One named there and
 // missing here would arrive as a mystery instead of running.
-globalThis.fetch = async () => ({ ok: true, json: async () => reply('{}') });
+globalThis.fetch = async () => resp(true, 200, reply('{}'));
 for (const p of Object.keys(OPENAI_COMPATIBLE)) {
   ok(KNOWN_PROVIDERS.has(p), `${p} is in the known-provider list as well as the table`);
   ok(/^https:\/\//.test(OPENAI_COMPATIBLE[p].baseUrl), `${p} has an https base url`);
@@ -86,11 +115,11 @@ await throws(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'nosuch', model: '
 
 // ---- 4. runPrompt routes by the CALLER's provider, never by guessing -------
 reset(reply('{"ok":true}'));
-globalThis.fetch = async (url, init) => { sent.push({ url: String(url), body: JSON.parse(init.body) }); return { ok: true, json: async () => reply('{"ok":true}') }; };
+globalThis.fetch = async (url, init) => { sent.push({ url: String(url), body: JSON.parse(init.body) }); return resp(true, 200, reply('{"ok":true}')); };
 await run(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'groq', model: 'llama-3.3-70b' }), 'runPrompt via groq');
 ok(/api\.groq\.com/.test((sent[0] || {}).url || ''), 'a groq job goes to groq, not to Gemini');
 reset(null);
-globalThis.fetch = async (url) => { sent.push({ url: String(url) }); return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"ok":true}' }] } }] }) }; };
+globalThis.fetch = async (url) => { sent.push({ url: String(url) }); return resp(true, 200, { candidates: [{ content: { parts: [{ text: '{"ok":true}' }] } }] }); };
 await run(() => doRunPrompt({ ...ENV, GEMINI_API_KEY: 'g' }, { prompt: 'hi', model: 'gemini-3.6-flash' }), 'runPrompt default');
 ok(/generativelanguage\.googleapis\.com/.test((sent[0] || {}).url || ''), 'and no provider named still means Gemini');
 
