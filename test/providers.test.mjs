@@ -1,0 +1,102 @@
+// Offline tests for v0.29: providers other than Gemini.
+//
+// Nearly every free API speaks OpenAI's chat-completions shape, so ONE adapter
+// covers Groq, OpenRouter, DeepSeek and the rest — a new provider is a row in a
+// table, not new logic. The thing worth testing is not the happy path but the
+// two ways this hurts you: a provider the app routes here that this Worker
+// cannot actually call, and a refusal that arrives as "call failed" instead of
+// the provider's own reason.
+//   node test/providers.test.mjs
+let pass = 0, fail = 0;
+let callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf, doRunPrompt, doSetProviderKey;
+try {
+  ({ callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf, doRunPrompt, doSetProviderKey } =
+    await import('../worker.js'));
+  if (typeof callOpenAICompatible !== 'function') throw new Error('callOpenAICompatible is not exported');
+} catch (e) {
+  console.log('  FAIL: the Worker can call a provider other than Gemini at all ->', e.message);
+  fail++;
+  const dead = async () => { throw new Error('not implemented'); };
+  callOpenAICompatible = doRunPrompt = doSetProviderKey = dead;
+  OPENAI_COMPATIBLE = {}; KNOWN_PROVIDERS = new Set(); textOf = () => '';
+}
+const ok = (cond, msg) => { if (cond) pass++; else { fail++; console.log('  FAIL:', msg); } };
+const eq = (got, want, msg) => ok(JSON.stringify(got) === JSON.stringify(want),
+  `${msg}\n        want ${JSON.stringify(want)}\n        got  ${JSON.stringify(got)}`);
+async function throws(fn, re, msg) {
+  try { await fn(); fail++; console.log('  FAIL (no throw):', msg); }
+  catch (e) { if (re.test(e.message)) pass++; else { fail++; console.log('  FAIL (wrong message):', msg, '->', e.message); } }
+}
+const run = async (fn, what) => {
+  try { return await fn(); } catch (e) { fail++; console.log(`  FAIL: ${what} threw ->`, e.message); return {}; }
+};
+
+let sent = [], answer = null;
+globalThis.fetch = async (url, init) => {
+  sent.push({ url: String(url), init, body: JSON.parse((init && init.body) || '{}') });
+  if (typeof answer === 'function') return answer();
+  return { ok: true, status: 200, json: async () => answer };
+};
+const reply = txt => ({ choices: [{ message: { content: txt } }] });
+const store = { 'provider-key:groq': JSON.stringify({ apiKey: 'gsk-live' }) };
+const ENV = { KEYS: { get: async k => store[k] ?? null, put: async (k, v) => { store[k] = v; }, delete: async k => { delete store[k]; } } };
+const reset = a => { sent = []; answer = a; };
+
+// ---- 1. the request is the shape they all copied from OpenAI ---------------
+reset(reply('{"n":1}'));
+let out = await run(() => callOpenAICompatible('groq', 'gsk-live', 'llama-3.3-70b', 'hello', null), 'groq call');
+eq(out, '{"n":1}', 'the answer comes back out of choices[0].message.content');
+const req = sent[0] || { body: {}, init: { headers: {} } };
+ok(/api\.groq\.com/.test(sent[0].url) && /\/chat\/completions$/.test(sent[0].url), 'to that provider\'s chat endpoint');
+eq(req.body.model, 'llama-3.3-70b', 'with the model the caller named');
+eq(req.body.messages[0].content, 'hello', 'and the prompt as one user turn');
+eq(req.body.temperature, 0, 'temperature 0 — these read quotes, they do not write poetry');
+eq(req.init.headers.Authorization, 'Bearer gsk-live', 'the key is a bearer header, never in the URL');
+ok(!/gsk-live/.test(sent[0].url), 'and really is not in the URL');
+
+// Pictures ride as content parts on the user turn — the OpenAI image shape.
+reset(reply('read it'));
+await run(() => callOpenAICompatible('groq', 'k', 'm', 'what is this', [{ data: 'AAAA', mimeType: 'image/png' }]), 'vision call');
+const parts = (sent[0] || { body: {} }).body.messages[0].content;
+ok(Array.isArray(parts) && parts[0].type === 'text' && parts[1].type === 'image_url', 'a picture becomes an image_url part');
+ok(/^data:image\/png;base64,AAAA$/.test(parts[1].image_url.url), 'as a data url with the right mime type');
+
+// ---- 2. 🔴 a refusal arrives in the provider's own words -------------------
+reset(null);
+globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: 'Invalid API Key' } }) });
+await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Invalid API Key/,
+  'the provider says why — "call failed" costs an hour guessing between key, model and quota');
+await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Groq/, 'and it says WHICH provider');
+globalThis.fetch = async () => { throw new Error('dns go boom'); };
+await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /could not be reached/, 'unreachable is its own answer');
+
+// ---- 3. 🔴 the two lists must not drift ------------------------------------
+// The app routes a job here from its OWN list of providers. One named there and
+// missing here would arrive as a mystery instead of running.
+globalThis.fetch = async () => ({ ok: true, json: async () => reply('{}') });
+for (const p of Object.keys(OPENAI_COMPATIBLE)) {
+  ok(KNOWN_PROVIDERS.has(p), `${p} is in the known-provider list as well as the table`);
+  ok(/^https:\/\//.test(OPENAI_COMPATIBLE[p].baseUrl), `${p} has an https base url`);
+  ok(!!OPENAI_COMPATIBLE[p].label, `${p} has a human label for its error messages`);
+}
+ok(KNOWN_PROVIDERS.has('gemini'), 'gemini is known even though it is not OpenAI-compatible');
+await throws(() => callOpenAICompatible('nosuch', 'k', 'm', 'hi', null), /Unknown provider/, 'an unlisted provider is refused, not guessed at');
+await throws(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'nosuch', model: 'm' }),
+  /not a provider this Worker can call/, 'and runPrompt refuses it before doing anything');
+
+// ---- 4. runPrompt routes by the CALLER's provider, never by guessing -------
+reset(reply('{"ok":true}'));
+globalThis.fetch = async (url, init) => { sent.push({ url: String(url), body: JSON.parse(init.body) }); return { ok: true, json: async () => reply('{"ok":true}') }; };
+await run(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'groq', model: 'llama-3.3-70b' }), 'runPrompt via groq');
+ok(/api\.groq\.com/.test((sent[0] || {}).url || ''), 'a groq job goes to groq, not to Gemini');
+reset(null);
+globalThis.fetch = async (url) => { sent.push({ url: String(url) }); return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: '{"ok":true}' }] } }] }) }; };
+await run(() => doRunPrompt({ ...ENV, GEMINI_API_KEY: 'g' }, { prompt: 'hi', model: 'gemini-3.6-flash' }), 'runPrompt default');
+ok(/generativelanguage\.googleapis\.com/.test((sent[0] || {}).url || ''), 'and no provider named still means Gemini');
+
+// ---- 5. flattening a Gemini payload for a provider that wants messages -----
+eq(textOf([{ parts: [{ text: 'a' }, { text: 'b' }] }]), 'a\n\nb', 'every part is kept');
+eq(textOf(null), '', 'and nothing is not a crash');
+
+console.log(`\nproviders: ${pass} pass, ${fail} fail`);
+if (fail) process.exitCode = 1;

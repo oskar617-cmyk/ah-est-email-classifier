@@ -106,8 +106,15 @@
 //           Vaenyx key in KV so each signed-in browser collects it instead of
 //           being pasted into. That key is the one credential meant to reach a
 //           browser: only a browser can be on the tailnet Vaenyx lives on.
-//           (current)
-const VERSION = 'v0.28';
+//   v0.29 — providers beyond Gemini. One OpenAI-compatible caller covers Groq,
+//           OpenRouter, Cerebras, DeepSeek and Mistral, so a new provider is a
+//           ROW in OPENAI_COMPATIBLE rather than new logic — the same shape
+//           Vaenyx settled on. setProviderKey now stores a key per provider
+//           (provider-key:<name>) and validates it with a real call. runPrompt
+//           routes on the provider the CALLER names: guessing it from the model
+//           id would be a naming-convention bet. KNOWN_PROVIDERS here and
+//           WORKER_PROVIDERS in the app must stay identical. (current)
+const VERSION = 'v0.29';
 
 // DEFAULT model — used only when the caller does not name one (see modelFor).
 // gemini-2.5-flash's free tier is only 250 requests/day, too small for bulk
@@ -441,16 +448,88 @@ async function geminiKeySource(env) {
   return { source: 'none', value: '', rec: null };
 }
 
-// Read + parse the KV record { apiKey, setBy, setAt }. A KV outage or a
-// mangled record must not take the AI down while the deploy-time secret still
-// exists, so failures degrade to "no record" instead of throwing.
-async function readKeyRecord(env) {
+// Read + parse the KV record { apiKey, setBy, setAt } for ONE provider. A KV
+// outage or a mangled record must not take the AI down while the deploy-time
+// secret still exists, so failures degrade to "no record" instead of throwing.
+async function readKeyRecord(env, provider) {
   if (!(env && env.KEYS)) return null;   // binding absent (old deploy) -> fallback path
   let raw = null;
-  try { raw = await env.KEYS.get(KV_KEY_GEMINI); }
+  try { raw = await env.KEYS.get(kvKeyFor(provider || 'gemini')); }
   catch (e) { console.warn('KEYS read failed:', e && e.message); return null; }
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+// ---------- other providers ----------
+//
+// Nearly every free API today speaks OpenAI's chat-completions shape, so one
+// adapter covers Groq, OpenRouter, DeepSeek, Cerebras and the rest — the same
+// approach Vaenyx settled on (its OPENAI_COMPATIBLE_PRESETS table). A new
+// provider is a ROW here, not new logic.
+//
+// 🔴 This table and the app's WORKER_PROVIDERS must agree. The app routes a job
+// here based on its own list; a provider named there and missing here arrives
+// as "unknown provider" instead of running, so add to both or neither.
+const OPENAI_COMPATIBLE = {
+  groq:       { label: 'Groq',       baseUrl: 'https://api.groq.com/openai/v1' },
+  openrouter: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
+  cerebras:   { label: 'Cerebras',   baseUrl: 'https://api.cerebras.ai/v1' },
+  deepseek:   { label: 'DeepSeek',   baseUrl: 'https://api.deepseek.com/v1' },
+  mistral:    { label: 'Mistral',    baseUrl: 'https://api.mistral.ai/v1' }
+};
+const KNOWN_PROVIDERS = new Set(['gemini', ...Object.keys(OPENAI_COMPATIBLE)]);
+const kvKeyFor = provider => `provider-key:${provider}`;
+
+// The key for any provider: KV, then (gemini only) the deploy-time secret.
+async function providerKey(env, provider) {
+  const rec = await readKeyRecord(env, provider);
+  if (rec && rec.apiKey) return String(rec.apiKey);
+  if (provider === 'gemini' && env && env.GEMINI_API_KEY) return env.GEMINI_API_KEY;
+  const e = new Error(`No ${provider} key is set — an admin can paste it in AH Estimating Settings (Model Connections)`);
+  e.status = 400; throw e;
+}
+
+// One call to an OpenAI-compatible provider. Images ride as content parts on
+// the last user turn, which is the shape they all copied from OpenAI.
+// Flatten Gemini-shaped `contents` back to plain text for a provider that
+// takes messages instead. The app sends one user turn for every embedded task,
+// so this is a join, not a conversion — a multi-turn payload would lose its
+// turn boundaries, which is why runMethod stays on the Gemini path.
+function textOf(contents) {
+  return (Array.isArray(contents) ? contents : [])
+    .flatMap(c => (c && c.parts) || [])
+    .map(part => (part && part.text) || '')
+    .filter(Boolean).join('\n\n');
+}
+
+async function callOpenAICompatible(provider, apiKey, model, prompt, media) {
+  const cfg = OPENAI_COMPATIBLE[provider];
+  if (!cfg) { const e = new Error(`Unknown provider "${provider}"`); e.status = 400; throw e; }
+  const content = (Array.isArray(media) && media.length)
+    ? [{ type: 'text', text: prompt },
+       ...media.filter(m => m && m.data).map(m => ({ type: 'image_url',
+         image_url: { url: `data:${m.mimeType || 'image/png'};base64,${m.data}` } }))]
+    : prompt;
+  let res;
+  try {
+    res = await fetch(`${cfg.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content }] })
+    });
+  } catch (err) {
+    const e = new Error(`${cfg.label} could not be reached: ${err && err.message}`); e.status = 502; throw e;
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    // The provider's OWN words. A generic "call failed" costs an hour of
+    // guessing at which of the key, the model id or the quota is wrong.
+    const why = (body && body.error && (body.error.message || body.error)) || `HTTP ${res.status}`;
+    const e = new Error(`${cfg.label} refused: ${String(why).slice(0, 300)}`); e.status = res.status; throw e;
+  }
+  const text = body && body.choices && body.choices[0] && body.choices[0].message
+    ? body.choices[0].message.content : '';
+  return typeof text === 'string' ? text : '';
 }
 
 // The 60s cache would otherwise keep serving the OLD key for up to a minute
@@ -479,8 +558,8 @@ async function doSetProviderKey(env, p, auth) {
     e.status = 403; throw e;
   }
   const provider = (p && p.provider) || '';
-  if (provider !== 'gemini') {
-    const e = new Error('Only the gemini key lives here so far');
+  if (!KNOWN_PROVIDERS.has(provider)) {
+    const e = new Error(`"${String(provider).slice(0, 40)}" is not a provider this Worker can call — it speaks ${[...KNOWN_PROVIDERS].join(', ')}`);
     e.status = 400; throw e;
   }
   const apiKey = (p && typeof p.apiKey === 'string') ? p.apiKey.trim() : '';
@@ -502,16 +581,22 @@ async function doSetProviderKey(env, p, auth) {
   // rotated in. Gemini's own words are passed through, so an admin can still
   // tell "model not found" from "API key not valid".
   try {
-    await callGemini(apiKey, 'Return exactly this JSON: {"ok":true}');
+    if (provider === 'gemini') await callGemini(apiKey, 'Return exactly this JSON: {"ok":true}');
+    // Same rule for the others: a real call, on a model the CALLER named, since
+    // an OpenAI-compatible provider has no single model every key can reach.
+    // Without a model we can only check the shape, and say so rather than
+    // pretend the key was proven.
+    else if (p && p.model) await callOpenAICompatible(provider, apiKey, String(p.model), 'Reply with the word ok.', null);
+    else if (apiKey.length < 20) { const e = new Error('That does not look like an API key'); e.status = 400; throw e; }
   } catch (err) {
-    const e = new Error(`That key was rejected, so it was NOT saved — ${String((err && err.message) || 'Gemini did not answer').slice(0, 300)}`);
+    const e = new Error(`That key was rejected, so it was NOT saved — ${String((err && err.message) || 'the provider did not answer').slice(0, 300)}`);
     e.status = 400; throw e;
   }
   const rec = { apiKey, setBy: auth.email, setAt: new Date().toISOString() };
-  await env.KEYS.put(KV_KEY_GEMINI, JSON.stringify(rec));
-  bustKeyCache();
+  await env.KEYS.put(kvKeyFor(provider), JSON.stringify(rec));
+  if (provider === 'gemini') bustKeyCache();
   // NEVER echo the key — last4 is enough for the admin to recognise it.
-  return { ok: true, provider: 'gemini', last4: apiKey.slice(-4), setBy: rec.setBy, setAt: rec.setAt };
+  return { ok: true, provider, last4: apiKey.slice(-4), setBy: rec.setBy, setAt: rec.setAt };
 }
 
 // keyStatus { provider? }: is a key configured and where would it come from.
@@ -660,11 +745,28 @@ async function doRunPrompt(env, p) {
   const contents = contentsOf(p);
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
   const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
-  const apiKey = await geminiKey(env);   // after the 400 checks — a bad request should say so, not "no key"
   // Resolved ONCE: the validation retry below must go back to the SAME model.
   // Retrying on a different one would mean the answer you finally get is not
   // from the model you chose, which is the whole thing this release is ending.
   const model = modelFor(p);
+  // Which company's model this is comes from the CALLER too. The app knows —
+  // it is the app's own setting — and guessing from the model id would be a
+  // naming-convention bet that breaks the first time somebody ships an id that
+  // looks like somebody else's.
+  const provider = (p && typeof p.provider === 'string' && p.provider.trim()) || 'gemini';
+  if (!KNOWN_PROVIDERS.has(provider)) {
+    const e = new Error(`"${provider.slice(0, 40)}" is not a provider this Worker can call`); e.status = 400; throw e;
+  }
+  if (provider !== 'gemini') {
+    // One shot, no schema retry: the OpenAI-compatible path has no equivalent
+    // of Gemini's JSON mode here, so a schema failure is reported honestly
+    // rather than papered over with a second guess.
+    const key = await providerKey(env, provider);
+    const out = parseJson(await callOpenAICompatible(provider, key, model, textOf(contents), mediaFromPayload(p)));
+    if (!schema) return { output: out, raw: '' };
+    return { output: out != null ? out : null, outputValid: validateOutput(out, schema).length === 0 };
+  }
+  const apiKey = await geminiKey(env);   // after the 400 checks — a bad request should say so, not "no key"
 
   let raw = await geminiGenerate(apiKey, contents, model);
   let output = parseJson(raw);
@@ -919,7 +1021,8 @@ export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
          geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
          modelFor, GEMINI_MODEL, doClassify, doVisionOcr,
-         doListModels, doGetRelayKey, doSetRelayKey };
+         doListModels, doGetRelayKey, doSetRelayKey,
+         callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf };
 
 // ---------- Gemini REST call ----------
 // Workers have native fetch but no SDK, so we call Gemini's REST endpoint directly.

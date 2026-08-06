@@ -109,8 +109,12 @@ await throws(() => doSetProviderKey(env, { provider: 'gemini', apiKey: 'AIzaVali
 await throws(() => doSetProviderKey(env, { provider: 'gemini', apiKey: 'AIzaValidLooking00000000' }, authUser),
   /key admin/, 'allow-listed but not a key admin -> refused, mentions admin');
 const callsBefore = geminiCalls;
+// v0.28 opened this to every provider the Worker can actually CALL. The rule
+// worth keeping is not "gemini only" — it is that the two lists cannot drift:
+// a provider it has no caller for must be refused, not stored and left to fail
+// on the first real job.
 await throws(() => doSetProviderKey(env, { provider: 'openai', apiKey: 'sk-SomeOtherProvider0000' }, authAdmin),
-  /Only the gemini key lives here/, 'other providers refused for now');
+  /not a provider this Worker can call/, 'a provider with no caller here is refused');
 await throws(() => doSetProviderKey(env, { provider: 'gemini', apiKey: '   ' }, authAdmin),
   /does not look like an API key/, 'a blank/mangled paste is refused');
 ok(geminiCalls === callsBefore, 'refused candidates never reach Gemini');
@@ -151,7 +155,7 @@ ok(st.configured === false && st.source === 'none' && st.last4 === '',
 await throws(() => doKeyStatus(env, {}, authNone), /ticket is missing/,
   'keyStatus also demands a valid ticket, even in soft mode');
 await throws(() => doKeyStatus(env, { provider: 'openai' }, authUser), /Only the gemini key lives here/,
-  'keyStatus for another provider -> refused for now');
+  'keyStatus still answers for gemini only - it reports the deploy-time secret fallback, which no other provider has');
 
 globalThis.fetch = realFetch;
 console.log(`\nkeys: ${pass} pass, ${fail} fail`);
