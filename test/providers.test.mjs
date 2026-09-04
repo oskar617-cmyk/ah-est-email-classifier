@@ -127,5 +127,28 @@ ok(/generativelanguage\.googleapis\.com/.test((sent[0] || {}).url || ''), 'and n
 eq(textOf([{ parts: [{ text: 'a' }, { text: 'b' }] }]), 'a\n\nb', 'every part is kept');
 eq(textOf(null), '', 'and nothing is not a crash');
 
+// ---- 6. a reasoning model's thinking is not its answer (v0.33) -------------
+// Groq's Qwen (and any model on reasoning_format "raw") sends its thinking in
+// <think>…</think> ahead of the JSON. The brace inside the thinking used to be
+// taken as the start of the object, so a correct answer "failed the schema".
+globalThis.fetch = async (url, init) => {
+  sent.push({ url: String(url), init, body: JSON.parse((init && init.body) || '{}') });
+  return typeof answer === 'function' ? answer() : resp(true, 200, answer);
+};
+const okSchema = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } };
+const qwen = { prompt: 'Return exactly this JSON: {"ok":true}', provider: 'groq', model: 'qwen/qwen3.6-27b', schema: okSchema };
+reset(reply('<think>\nThe user wants {"ok":true}. I must return exactly that.\n</think>\n{"ok":true}'));
+out = await run(() => doRunPrompt(ENV, qwen), 'runPrompt with <think>');
+eq(out, { output: { ok: true }, outputValid: true }, 'the answer after the thinking is the answer');
+reset(reply('Thinking about {"ok":false} first...\n</think>\n```json\n{"ok":true}\n```'));
+out = await run(() => doRunPrompt(ENV, qwen), 'runPrompt, closing tag only');
+eq(out, { output: { ok: true }, outputValid: true }, 'a closing tag with no opening tag (Qwen chat template) is handled too');
+reset(reply('<think>still thinking about {"ok":'));
+out = await run(() => doRunPrompt(ENV, qwen), 'runPrompt, truncated thinking');
+eq(out, { output: null, outputValid: false }, 'thinking that never finished is not mistaken for an answer');
+reset(reply('Draft: {"ok":false}\nFinal answer: {"ok":true}'));
+out = await run(() => doRunPrompt(ENV, qwen), 'runPrompt, prose then answer');
+eq(out, { output: { ok: true }, outputValid: true }, 'the LAST balanced object is the answer, not first-brace-to-last-brace');
+
 console.log(`\nproviders: ${pass} pass, ${fail} fail`);
 if (fail) process.exitCode = 1;

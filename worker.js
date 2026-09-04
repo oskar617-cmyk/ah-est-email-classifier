@@ -136,8 +136,15 @@
 //           could be replaced but never removed, so a key you had stopped using
 //           sat in KV for ever. Clearing is an explicit flag, never "an empty
 //           apiKey means delete" -- that would let a mis-wired form wipe the
-//           company key and stop every computer at once. (current)
-const VERSION = 'v0.32';
+//           company key and stop every computer at once.
+//   v0.33 — a reasoning model's thinking is not its answer. Groq's Qwen (and
+//           any model on reasoning_format "raw") sends <think>…</think> ahead
+//           of the JSON; the brace inside it was taken as the start of the
+//           object, so a correct {"ok":true} "failed the schema" and Qwen could
+//           never be a working backup. parseJson now drops the thinking and
+//           takes the LAST balanced object. Same code in ah-estimating
+//           js/ai-json.js (Direct path) — keep them identical. (current)
+const VERSION = 'v0.33';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -1332,13 +1339,60 @@ function safe(s) {
   return (s == null ? '' : String(s)).slice(0, 5000);
 }
 
+// 🔴 KEPT IN SYNC with ah-estimating js/ai-json.js: the Worker path and the
+// app's Direct path must read an answer the same way, or a model passes Test
+// on one road and "fails the schema" on the other.
+//
+// Reasoning models (Groq's Qwen, DeepSeek R1, anything on reasoning_format
+// "raw") put their thinking in the text ahead of the answer:
+//   <think> the user wants {"ok":true} ... </think>\n{"ok":true}
+// That thinking is not the answer. Left in, the brace inside it became the
+// "start" of the object, "first { to last }" swallowed the lot, and a perfectly
+// good {"ok":true} was reported as failing the schema (Groq Qwen3.6 27B, 4 Sep
+// 2026). Qwen's own chat template can also emit ONLY the closing tag.
+function stripThinking(text) {
+  let s = String(text == null ? '' : text);
+  s = s.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const close = s.toLowerCase().lastIndexOf('</think>');
+  if (close >= 0) s = s.slice(close + '</think>'.length);
+  // Thinking that never closed (cut off by a token limit) has no answer in it.
+  s = s.replace(/<think>[\s\S]*$/i, '');
+  return s.trim();
+}
+
+// Every top-level balanced {...} in the text, in order. String-aware, so a
+// brace inside a JSON string does not open or close anything.
+function balancedObjects(s) {
+  const out = [];
+  let depth = 0, start = -1, inStr = false, esc = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { if (depth > 0) inStr = true; continue; }
+    if (c === '{') { if (depth === 0) start = i; depth++; }
+    else if (c === '}' && depth > 0) { depth--; if (depth === 0) out.push(s.slice(start, i + 1)); }
+  }
+  return out;
+}
+
+// The JSON object in a model's reply, or null. Bare JSON and a ```json fence
+// are taken as they are; otherwise the LAST balanced object that parses - the
+// last, because a model that explains before it answers puts the object at the
+// end; balanced, because a brace in the explanation must not be mistaken for
+// where the answer starts.
 function parseJson(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/^```json\s*/i, '').replace(/```$/, '').trim();
-  try { return JSON.parse(cleaned); } catch (e) {}
-  const m = cleaned.match(/\{[\s\S]*\}/);
-  if (m) {
-    try { return JSON.parse(m[0]); } catch (e) { return null; }
+  const s = stripThinking(text);
+  if (!s) return null;
+  const cleaned = s.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  try { return JSON.parse(cleaned); } catch (e) { /* not bare JSON */ }
+  const blocks = balancedObjects(cleaned);
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    try { return JSON.parse(blocks[i]); } catch (e) { /* try the one before it */ }
   }
   return null;
 }
