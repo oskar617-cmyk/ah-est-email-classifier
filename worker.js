@@ -143,8 +143,12 @@
 //           object, so a correct {"ok":true} "failed the schema" and Qwen could
 //           never be a working backup. parseJson now drops the thinking and
 //           takes the LAST balanced object. Same code in ah-estimating
-//           js/ai-json.js (Direct path) — keep them identical. (current)
-const VERSION = 'v0.33';
+//           js/ai-json.js (Direct path) — keep them identical.
+//   v0.34 — listModels takes { provider }. Gemini stays Google's own list;
+//           any OpenAI-compatible provider (Groq first) answers GET /models
+//           with the company key, inactive entries dropped. Names only, as
+//           ever - capability and price never come from a list. (current)
+const VERSION = 'v0.34';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -282,7 +286,7 @@ export default {
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
       else if (task === 'setProviderKey')    result = await doSetProviderKey(env, payload, auth);
       else if (task === 'keyStatus')         result = await doKeyStatus(env, payload, auth);
-      else if (task === 'listModels')        result = await doListModels(env);
+      else if (task === 'listModels')        result = await doListModels(env, payload);
       else if (task === 'getRelayKey')       result = await doGetRelayKey(env, payload, auth);
       else if (task === 'setRelayKey')       result = await doSetRelayKey(env, payload, auth);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
@@ -760,7 +764,13 @@ async function doKeyStatus(env, p, auth) {
 // and a vision model both say generateContent. Do not try to light up Image In
 // from this; that stays with the app's local table or a real probe.
 const GOOGLE_MODELS_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-async function doListModels(env) {
+// v0.34: { provider } picks whose catalogue. Gemini is Google's own list as
+// before; every OpenAI-compatible provider answers GET /models with the same
+// shape they all copied from OpenAI, so Groq (and the rest of the table) can
+// be asked with the company key too. Still names only - never capability.
+async function doListModels(env, p) {
+  const provider = (p && typeof p.provider === 'string' && p.provider.trim()) || 'gemini';
+  if (provider !== 'gemini') return listOpenAICompatibleModels(env, provider);
   const apiKey = await geminiKey(env);
   const out = [];
   let pageToken = '';
@@ -793,7 +803,36 @@ async function doListModels(env) {
     pageToken = (body && body.nextPageToken) || '';
     if (!pageToken) break;
   }
-  return { models: out, fetchedAt: new Date().toISOString() };
+  return { provider: 'gemini', models: out, fetchedAt: new Date().toISOString() };
+}
+
+// GET {baseUrl}/models for an OpenAI-compatible provider: { data: [{ id,
+// owned_by?, active? }] }. Inactive entries are dropped (Groq marks retired
+// models active:false rather than removing them).
+async function listOpenAICompatibleModels(env, provider) {
+  const cfg = OPENAI_COMPATIBLE[provider];
+  if (!cfg) { const e = new Error(`"${String(provider).slice(0, 40)}" is not a provider this Worker can list`); e.status = 400; throw e; }
+  const key = await providerKey(env, provider);
+  let res;
+  try { res = await fetch(`${cfg.baseUrl}/models`, { headers: { Authorization: `Bearer ${key}` } }); }
+  catch (err) { const e = new Error(`Could not reach ${cfg.label} to list models: ${err && err.message}`); e.status = 502; throw e; }
+  let raw = '';
+  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
+  let body = null;
+  try { body = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
+  if (!res.ok) {
+    const why = (body && body.error && (body.error.message || body.error)) || raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || `HTTP ${res.status}`;
+    const e = new Error(`${cfg.label} refused the model list — ${String(why).slice(0, 300)}`); e.status = res.status; throw e;
+  }
+  const out = [];
+  for (const m of ((body && body.data) || [])) {
+    const id = String((m && m.id) || '').trim();
+    if (!id || (m && m.active === false)) continue;
+    out.push({ id, label: id, ownedBy: (m && m.owned_by) || '', contextWindow: (m && m.context_window) || null });
+  }
+  // The provider is echoed so an app talking to an OLDER Worker (which ignored
+  // the field and answered with Google's list) can tell the difference.
+  return { provider, models: out, fetchedAt: new Date().toISOString() };
 }
 
 // Is this key real? Asks Google to list the models the key can see — the same

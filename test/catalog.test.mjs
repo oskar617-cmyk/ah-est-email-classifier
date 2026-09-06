@@ -139,5 +139,27 @@ eq((await run(() => doGetRelayKey(ENV, {}, USER), 'getRelayKey')).token, '', 'no
 store = { 'relay-key:vaenyx': '{not json' };
 eq((await run(() => doGetRelayKey(ENV, {}, USER), 'getRelayKey')).token, '', 'a corrupt record degrades to "none"');
 
+// ---- listModels for an OpenAI-compatible provider (v0.34) -------------------
+// Groq answers GET /models in the shape they all copied from OpenAI; retired
+// models stay in the list with active:false and must not be offered.
+store['provider-key:groq'] = JSON.stringify({ apiKey: 'gsk-live' });
+seen = [];
+globalThis.fetch = async (url, init) => {
+  seen.push({ url: String(url), headers: (init && init.headers) || {} });
+  const body = { data: [
+    { id: 'qwen/qwen3.8-27b', owned_by: 'Alibaba', active: true, context_window: 131072 },
+    { id: 'llama-4-scout', owned_by: 'Meta', active: false },
+    { id: 'whisper-large-v3', owned_by: 'OpenAI', active: true }
+  ] };
+  return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+};
+r = await run(() => doListModels(ENV, { provider: 'groq' }), 'listModels groq');
+eq(r.models.map(m => m.id), ['qwen/qwen3.8-27b', 'whisper-large-v3'], 'active models come back under their ids; a retired one (active:false) is dropped');
+ok(/api\.groq\.com\/openai\/v1\/models$/.test((seen[0] || {}).url || ''), 'asked at that provider\'s /models endpoint');
+eq(((seen[0] || {}).headers || {}).Authorization, 'Bearer gsk-live', 'with the company key as a Bearer header');
+globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: 'Invalid API Key' } }), text: async () => JSON.stringify({ error: { message: 'Invalid API Key' } }) });
+await throws(() => doListModels(ENV, { provider: 'groq' }), /Groq refused the model list — Invalid API Key/, 'a refusal carries the provider\'s own words');
+await throws(() => doListModels(ENV, { provider: 'nosuch' }), /not a provider this Worker can list/, 'an unknown provider is refused, not guessed at');
+
 console.log(`\ncatalog: ${pass} pass, ${fail} fail`);
 if (fail) process.exitCode = 1;
