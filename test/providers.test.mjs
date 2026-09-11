@@ -60,6 +60,7 @@ ok(/api\.groq\.com/.test(sent[0].url) && /\/chat\/completions$/.test(sent[0].url
 eq(req.body.model, 'llama-3.3-70b', 'with the model the caller named');
 eq(req.body.messages[0].content, 'hello', 'and the prompt as one user turn');
 eq(req.body.temperature, 0, 'temperature 0 — these read quotes, they do not write poetry');
+eq(req.body.max_tokens, 4096, 'max_tokens is named (v0.35): unset, Groq budgets the full 16k output against its 8k/min free limit and refuses');
 eq(req.init.headers.Authorization, 'Bearer gsk-live', 'the key is a bearer header, never in the URL');
 ok(!/gsk-live/.test(sent[0].url), 'and really is not in the URL');
 
