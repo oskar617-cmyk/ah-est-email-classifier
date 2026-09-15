@@ -149,10 +149,12 @@
 //           with the company key, inactive entries dropped. Names only, as
 //           ever - capability and price never come from a list.
 //   v0.35 — OpenAI-compatible calls name max_tokens (4096). Left unset, Groq
-//           budgets the model's full 16k output against the free tier's
-//           8k-per-minute limit and refuses the request before running it
-//           ("Request too large ... OTPM"), so the Qwen backup never worked
-//           on a real quote - only on the tiny Test. (current)
+//           budgets the model's own maximum output against a per-minute output
+//           budget and refuses before running ("Request too large ... OTPM").
+//           CORRECTION (2026-09-16, measured): 4,096 is still far above
+//           qwen/qwen3.6-27b's 1,000-per-minute output cap on our free
+//           account, so that model stays unusable whatever we send;
+//           openai/gpt-oss-120b is the Groq model that works. (current)
 const VERSION = 'v0.35';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
@@ -587,13 +589,15 @@ async function callOpenAICompatible(provider, apiKey, model, prompt, media) {
     res = await fetch(`${cfg.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      // max_tokens is SAID, not left to the provider. Groq counts the request's
-      // output allowance against its per-minute output-token limit BEFORE
-      // answering, and with no max_tokens it assumes the model's maximum
-      // (16,384 for Qwen) - over the free tier's 8,000 - so every real quote
-      // read on the backup came back "Request too large ... (OTPM)" while the
-      // tiny Test passed (2026-09-11). The answers here are JSON of a few
-      // hundred tokens; 4,096 is the same cap the app's Direct path uses.
+      // max_tokens is SAID, not left to the provider: Groq charges a request's
+      // output allowance against a per-minute output budget BEFORE answering,
+      // and with none set it assumes the model's own maximum.
+      // MEASURED on our free account 2026-09-16, not read off a docs table:
+      // qwen/qwen3.6-27b is capped at 1,000 output tokens a minute and refuses
+      // every call at this size - unusable here; openai/gpt-oss-120b read a
+      // full-length quote in 7s (answer ~1,750 tokens); qwen3.8 answered
+      // nothing. 4,096 matches the app's Direct path and leaves a thinking
+      // model room to finish.
       body: JSON.stringify({ model, temperature: 0, max_tokens: 4096, messages: [{ role: 'user', content }] })
     });
   } catch (err) {
