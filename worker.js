@@ -161,8 +161,15 @@
 //           returns the page's TEXT and the app runs its usual analysis on it.
 //           Narrow on purpose - http(s) only, no private hosts, 15s, 3MB, page
 //           content types only, a PDF is reported rather than guessed at, and
-//           nothing of ours (cookie, key, ticket) is sent. (current)
-const VERSION = 'v0.36';
+//           nothing of ours (cookie, key, ticket) is sent.
+//   v0.37 — the approved-model list, so BOTH ends check the evidence (v12 §4).
+//           The settings page mirrors its pick list into KV (setModelAllow) and
+//           runPrompt refuses a model that is not on it, naming the way out:
+//           Test it and press Use. An EMPTY list refuses nothing - every copy
+//           of the app older than this pushes none, and locking those out would
+//           stop the inbox mid-scan. The lock arms itself on the first Use.
+//           (current)
+const VERSION = 'v0.37';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -302,6 +309,8 @@ export default {
       else if (task === 'keyStatus')         result = await doKeyStatus(env, payload, auth);
       else if (task === 'listModels')        result = await doListModels(env, payload);
       else if (task === 'fetchUrl')          result = await doFetchUrl(payload);
+      else if (task === 'setModelAllow')     result = await doSetModelAllow(env, payload, auth);
+      else if (task === 'getModelAllow')     result = await doGetModelAllow(env, payload, auth);
       else if (task === 'getRelayKey')       result = await doGetRelayKey(env, payload, auth);
       else if (task === 'setRelayKey')       result = await doSetRelayKey(env, payload, auth);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
@@ -960,6 +969,68 @@ async function doFetchUrl(p) {
   };
 }
 
+// ---------- the approved-model list: evidence, not a greyed-out button ------
+//
+// AI-CONNECT v12 §4 wants BOTH ends to check that a model was really tested and
+// really put into use, rather than trusting that the button looked disabled.
+// The evidence itself lives in the app's shared settings file on SharePoint,
+// which this Worker cannot see — so the settings page MIRRORS the approved list
+// here whenever someone presses Use, Stop Using or Save Assignments, and
+// runPrompt refuses anything that is not on it.
+//
+// 🔴 An EMPTY list means "not configured yet" and refuses nothing. Every copy
+// of the app deployed before today pushes no list, and locking those out would
+// stop the inbox on the est machine within a minute. The lock arms itself the
+// first time someone presses Use.
+const KV_KEY_MODEL_ALLOW = 'model-allow';
+
+async function readModelAllow(env) {
+  if (!(env && env.KEYS)) return null;
+  let raw = null;
+  try { raw = await env.KEYS.get(KV_KEY_MODEL_ALLOW); }
+  catch (e) { console.warn('model-allow read failed:', e && e.message); return null; }
+  if (!raw) return null;
+  try { const rec = JSON.parse(raw); return Array.isArray(rec && rec.models) ? rec : null; }
+  catch (e) { return null; }
+}
+
+// Throws unless the model is approved. Silent when no list has been pushed.
+async function requireApprovedModel(env, provider, model) {
+  const rec = await readModelAllow(env);
+  if (!rec || !rec.models.length) return;
+  const approved = rec.models.some(m => m && m.id === model && (!m.provider || m.provider === provider));
+  if (approved) return;
+  const e = new Error(`${model} is not on this app's approved list — open Settings, AI & Models, Test it and press Use. (Approved: ${rec.models.map(m => m.id).slice(0, 6).join(', ')})`);
+  e.status = 403; throw e;
+}
+
+// The app pushes the whole list, not one model at a time: it is a mirror of the
+// app's own pick list, and a partial update would leave the two disagreeing.
+async function doSetModelAllow(env, p, auth) {
+  requireValidTicket(auth);
+  if (!env.KEYS) throw new Error('The key store is not configured on this Worker (KEYS binding missing) — tell the admin');
+  const raw = Array.isArray(p && p.models) ? p.models : null;
+  if (!raw) { const e = new Error('models must be a list'); e.status = 400; throw e; }
+  const models = [];
+  for (const m of raw.slice(0, 60)) {
+    const id = String((m && m.id) || '').trim();
+    if (!id || models.some(x => x.id === id)) continue;
+    const provider = String((m && m.provider) || '').trim();
+    models.push({ id: id.slice(0, 120), provider: provider.slice(0, 40) });
+  }
+  const rec = { models, setBy: auth.email, setAt: new Date().toISOString() };
+  await env.KEYS.put(KV_KEY_MODEL_ALLOW, JSON.stringify(rec));
+  return { ok: true, count: models.length, setBy: rec.setBy, setAt: rec.setAt };
+}
+
+// What the Worker currently approves — so the settings page can show that both
+// ends agree, instead of everyone assuming they do.
+async function doGetModelAllow(env, p, auth) {
+  requireValidTicket(auth);
+  const rec = await readModelAllow(env);
+  return rec ? { models: rec.models, setBy: rec.setBy || '', setAt: rec.setAt || '' } : { models: [], setBy: '', setAt: '' };
+}
+
 // Is this key real? Asks Google to list the models the key can see — the same
 // endpoint as above, but with a CANDIDATE key rather than the stored one, and
 // only the verdict matters. Throws with Google's own message when it does not.
@@ -1054,6 +1125,11 @@ async function doRunPrompt(env, p) {
   // Retrying on a different one would mean the answer you finally get is not
   // from the model you chose, which is the whole thing this release is ending.
   const model = modelFor(p, provider);
+  // Both ends check the evidence (AI-CONNECT v12 §4). The settings page will
+  // not offer a model nobody tested and used; this refuses one that reached the
+  // Worker anyway - a browser left open on last week's settings, a copy of the
+  // app that never reloaded, or a request that never came from the app at all.
+  await requireApprovedModel(env, provider, model);
   if (provider !== 'gemini') {
     // One shot, no schema retry: the OpenAI-compatible path has no equivalent
     // of Gemini's JSON mode here, so a schema failure is reported honestly
@@ -1318,6 +1394,7 @@ export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          modelFor, geminiUrl, doClassify, doVisionOcr,
          doListModels, validateGeminiKey, doGetRelayKey, doSetRelayKey,
          doFetchUrl, htmlToText, publicHttpUrl,
+         doSetModelAllow, doGetModelAllow, requireApprovedModel,
          callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf };
 
 // ---------- Gemini REST call ----------
