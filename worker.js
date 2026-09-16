@@ -154,8 +154,15 @@
 //           CORRECTION (2026-09-16, measured): 4,096 is still far above
 //           qwen/qwen3.6-27b's 1,000-per-minute output cap on our free
 //           account, so that model stays unusable whatever we send;
-//           openai/gpt-oss-120b is the Groq model that works. (current)
-const VERSION = 'v0.35';
+//           openai/gpt-oss-120b is the Groq model that works.
+//   v0.36 — fetchUrl: read a PUBLIC page a supplier linked to. More quotes
+//           arrive as "view your proposal" than as a PDF, and a browser cannot
+//           read another company's page (CORS). No model is involved: this
+//           returns the page's TEXT and the app runs its usual analysis on it.
+//           Narrow on purpose - http(s) only, no private hosts, 15s, 3MB, page
+//           content types only, a PDF is reported rather than guessed at, and
+//           nothing of ours (cookie, key, ticket) is sent. (current)
+const VERSION = 'v0.36';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
@@ -294,6 +301,7 @@ export default {
       else if (task === 'setProviderKey')    result = await doSetProviderKey(env, payload, auth);
       else if (task === 'keyStatus')         result = await doKeyStatus(env, payload, auth);
       else if (task === 'listModels')        result = await doListModels(env, payload);
+      else if (task === 'fetchUrl')          result = await doFetchUrl(payload);
       else if (task === 'getRelayKey')       result = await doGetRelayKey(env, payload, auth);
       else if (task === 'setRelayKey')       result = await doSetRelayKey(env, payload, auth);
       else return jsonResponse({ error: 'Unknown task' }, 400, corsHeaders);
@@ -851,6 +859,107 @@ async function listOpenAICompatibleModels(env, provider) {
   return { provider, models: out, fetchedAt: new Date().toISOString() };
 }
 
+// ---------- fetchUrl: read a PUBLIC page a supplier linked to ----------
+//
+// Quotes increasingly arrive as "click to view your proposal" instead of an
+// attachment. The browser cannot read that page: it belongs to someone else's
+// domain and CORS says no. The Worker can, and that is the only reason this
+// task exists. NO MODEL IS INVOLVED here — this hands back text, and the app
+// runs its usual quote analysis on it.
+//
+// 🔴 What comes back is TEXT WRITTEN BY A STRANGER. It travels to the app as
+// data, never as instructions, and the amount still stops at the human gate
+// before anything is saved. The request carries none of ours: no cookie, no
+// key, no sign-in ticket, and nothing about the job.
+//
+// Deliberately narrow: http(s) only, no private or loopback hosts, a short
+// timeout, a hard size cap, page content types only. A PDF link is REPORTED as
+// a PDF rather than guessed at.
+const FETCH_URL_TIMEOUT_MS = 15000;
+const FETCH_URL_MAX_BYTES = 3 * 1024 * 1024;
+const FETCH_URL_MAX_CHARS = 12000;
+// Loopback, link-local and the three private IPv4 ranges, plus the hostnames a
+// LAN hands out. Workers cannot reach a private network anyway; this refuses
+// in our own words instead of returning a confusing network error.
+const PRIVATE_HOST = /^(localhost|\[?::1\]?|127\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)|\.(local|internal|localdomain)$/i;
+
+function publicHttpUrl(raw) {
+  let u;
+  try { u = new URL(String(raw || '').trim()); }
+  catch (e) { const err = new Error('That is not a web address'); err.status = 400; throw err; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+    const e = new Error(`Only web addresses can be opened, not ${u.protocol.replace(':', '')} ones`); e.status = 400; throw e;
+  }
+  if (u.username || u.password) { const e = new Error('A web address with a password in it is not opened'); e.status = 400; throw e; }
+  if (PRIVATE_HOST.test(u.hostname)) { const e = new Error('That address is on a private network, not the public web'); e.status = 400; throw e; }
+  return u;
+}
+
+// Page markup to readable text. Scripts and styles go entirely (their contents
+// are not words); block ends become line breaks so a price table does not run
+// into one line.
+function htmlToText(html) {
+  return String(html || '')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style|noscript|svg|head)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|tr|li|h[1-6]|section|article|table)\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/gi, ' ').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"').replace(/&(?:#0?39|apos|rsquo);/gi, "'")
+    .replace(/&#(\d{1,7});/g, (m, d) => { const n = Number(d); return (n > 31 && n < 1114111) ? String.fromCodePoint(n) : ' '; })
+    .replace(/&amp;/gi, '&')
+    .replace(/[ \t ]+/g, ' ')
+    .replace(/ *\n */g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+async function doFetchUrl(p) {
+  const u = publicHttpUrl(p && p.url);
+  let res;
+  try {
+    res = await fetch(u.href, {
+      redirect: 'follow',
+      headers: {
+        // Say who we are. A quote page that refuses robots should refuse us by
+        // name rather than be fooled by a borrowed browser string.
+        'User-Agent': 'AH-Estimating-Quote-Reader/1.0 (+https://ah-estimating.pages.dev)',
+        Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1'
+      },
+      signal: AbortSignal.timeout(FETCH_URL_TIMEOUT_MS)
+    });
+  } catch (err) {
+    const e = new Error(`Could not open that link: ${(err && err.message) || 'no answer'}`); e.status = 502; throw e;
+  }
+  if (!res.ok) {
+    const why = (res.status === 401 || res.status === 403) ? ' — it needs a sign-in we do not have'
+      : res.status === 404 ? ' — that page is gone' : '';
+    const e = new Error(`That link answered ${res.status}${why}`); e.status = res.status; throw e;
+  }
+  const type = String(res.headers.get('content-type') || '').toLowerCase();
+  const finalUrl = res.url || u.href;
+  // A PDF is a real answer, not a failure: the app knows how to read one, but
+  // it has to come down the file road, so say what it is and stop.
+  if (/pdf/.test(type)) return { kind: 'pdf', url: finalUrl, contentType: 'application/pdf', text: '' };
+  if (!/text\/html|xhtml|text\/plain/.test(type)) {
+    const e = new Error(`That link is ${type.split(';')[0] || 'not a page'}, which cannot be read as a quote`); e.status = 415; throw e;
+  }
+  const declared = Number(res.headers.get('content-length') || 0);
+  if (declared && declared > FETCH_URL_MAX_BYTES) { const e = new Error('That page is too big to read'); e.status = 413; throw e; }
+  let raw = '';
+  try { raw = await res.text(); } catch (err) { const e = new Error('That page could not be read as text'); e.status = 502; throw e; }
+  if (raw.length > FETCH_URL_MAX_BYTES) raw = raw.slice(0, FETCH_URL_MAX_BYTES);
+  const titleRaw = (/<title[^>]*>([\s\S]{0,300}?)<\/title>/i.exec(raw) || [])[1] || '';
+  const full = /text\/plain/.test(type) ? raw.replace(/\r\n/g, '\n').trim() : htmlToText(raw);
+  const text = full.slice(0, FETCH_URL_MAX_CHARS);
+  return {
+    kind: 'page', url: finalUrl, contentType: type.split(';')[0],
+    title: htmlToText(titleRaw).slice(0, 200),
+    text, chars: full.length, truncated: full.length > text.length
+  };
+}
+
 // Is this key real? Asks Google to list the models the key can see — the same
 // endpoint as above, but with a CANDIDATE key rather than the stored one, and
 // only the verdict matters. Throws with Google's own message when it does not.
@@ -1208,6 +1317,7 @@ export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
          geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
          modelFor, geminiUrl, doClassify, doVisionOcr,
          doListModels, validateGeminiKey, doGetRelayKey, doSetRelayKey,
+         doFetchUrl, htmlToText, publicHttpUrl,
          callOpenAICompatible, OPENAI_COMPATIBLE, KNOWN_PROVIDERS, textOf };
 
 // ---------- Gemini REST call ----------
