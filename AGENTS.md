@@ -38,13 +38,16 @@ runtime/contract 改动:bump Worker VERSION + 文件头版本史 → 语法 + �
 ## 9. Shared Rulesets
 (AH-PWA-MSAL 不适用:本 repo 非 PWA,不负责客户端 MSAL 骨架;只验证 App 送来的 ID token。)
 
-<!-- SHARED-RULESET:AH-SUITE VERSION:3 UPDATED:2026-08-05 -->
-- 套件:Auzzie Homes Pty Ltd(墨尔本建筑公司)内部工作 app 套件;各 app 经 jobCode 互联;**`ah-jobs-rego` 是全套件 job 数据唯一 source of truth,任何 app 不得自建 job list**。
+<!-- SHARED-RULESET:AH-SUITE VERSION:4 UPDATED:2026-10-19 -->
+- 套件:Auzzie Homes Pty Ltd(墨尔本建筑公司)内部工作 app 套件;各 app 经 jobCode 互联。**AH Site 的 `AH Jobs Rego Jobs List` 是工程主数据唯一 source of truth;Vaestimating 是工程与人员的业务管理入口,其他 app 不得另建可编辑的工程主登记表**。保留现有 List / 记录 ID、内部字段、jobCode、四种状态及真实文件夹路径契约。
+- `AH Jobs Rego People List` 是工作人员目录的唯一权威,与各 app 的账号、成员资格和权限分开;新增人员不自动建账号、邀请或授权。其他消费 app 仍按原授权直接读取两张 List,不依赖 Vaestimating 网页或登录会话。
+- Site Flow 保留自己的工作列表和独立流程状态,通过 Scan 对照工程主登记表更新;它不是第二份可编辑工程主登记表。各 app 按自己的刷新机制读取,主登记表更新不等于所有 app 立即刷新。
 - SharePoint 拓扑(锁定):所有 Lists 在 AH Site(`auzziehomes.sharepoint.com/sites/AHSite`);文件/文件夹留各自原站(默认 AHOffice)。List 命名 `[App Name] [Purpose] List`(空格分隔、无连字符);config 存确切字符串,读其他 app 的 List 必须逐字一致。
 - 单一 Entra tenant `ff968505-cca0-4cd1-9f6d-68ce6eaf06c7`;one app one registration;admin `oskar@auhs.com.au`。
 - 本地测试连的是**真 SharePoint 数据**:测试 job 用明显 TEST 名,测完删除。
 - AI 功能默认经 Cloudflare Worker 代理调用(模型 key 不写进前端代码;用户在设置里自带 key 的 Direct 模式除外)。
 - 套件踩坑库 = ah-files repo 的 `docs/LESSONS.md`(L 编号);动工前只扫 `## L` 标题清单(`grep -n '^## L'`,一屏看完),命中相关条目才读该节全文,绝不默认全文加载;踩到 >30 分钟的架构坑必须加一条(在只见本 repo 的环境读不到时,请 Oskar 提供)。
+
 
 ## 10. Known Hazards
 - push 即上线:半成品绝不 push。
