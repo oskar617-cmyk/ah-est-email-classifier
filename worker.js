@@ -170,7 +170,9 @@ import {commercialAuthority,commercialTaskAllowed} from './commercial-auth.js';
 //           of the app older than this pushes none, and locking those out would
 //           stop the inbox mid-scan. The lock arms itself on the first Use.
 //           (current)
-const VERSION = 'v0.37';
+//   v0.38 — commercial Microsoft tickets require current company Gate authority,
+//           explicit company binding and independent settings/key permissions.
+const VERSION = 'v0.38';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
