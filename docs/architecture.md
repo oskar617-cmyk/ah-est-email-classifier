@@ -37,3 +37,7 @@
 - 删除任何旧 task 前,先在 ah-estimating 全 repo 查零调用并跑完整测试。
 - `visionAmount/visionOcr/matchBudgetItem` 与 takeoff 三任务目前不是死码,不得随固定 prompt handler 一起删除。
 - `REQUIRE_AUTH=1` 前必须确认生产 App 每条 Worker 请求都带 ticket,并真测 401 refresh retry。
+
+## Commercial Company Authorization
+
+Commercial Microsoft tickets are validated against the configured commercial audience, then checked against the current Vaestimating Gate company session. The configured company allow-list, immutable Microsoft tenant/object ID, current permissions and expiry must all agree. Commercial origins require this hard check even while legacy REQUIRE_AUTH remains soft. Provider keys, model-allow lists and relay settings additionally require manage_settings. The existing company KV remains the only key store; enabling the commercial audience does not grant another company access to these keys. Clearing the company enable flag at Gate pauses this path.

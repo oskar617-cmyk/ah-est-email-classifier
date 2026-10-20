@@ -31,7 +31,13 @@ compatibility_date = "2025-09-01"
 VANTA_BASE = "https://kaa-nuc.tailc0993f.ts.net"
 # Origins allowed to call this Worker. Live PWA is on pages.dev; github.io is
 # the backup host. Add localhost origins here if testing the runner locally.
-CORS_ORIGINS = "https://ah-estimating.pages.dev,https://oskar617-cmyk.github.io"
+CORS_ORIGINS = "https://ah-estimating.pages.dev,https://oskar617-cmyk.github.io,https://est.vaef.app,https://vaestimating.pages.dev"
+# Existing company gateway only. Every commercial request rechecks current Gate authority.
+COMMERCIAL_CLIENT_ID = "c9d561a3-2ff4-4c42-8eb7-a1f00602395d"
+COMMERCIAL_COMPANIES_JSON = '["34cb921f-0539-4ff4-aaf0-fdcbbc9f947f"]'
+COMMERCIAL_GATE_URL = "https://est-gate.vaef.app/v1/org/workflow/ai"
+COMMERCIAL_APP_ORIGIN = "https://est.vaef.app"
+COMMERCIAL_ORIGINS = "https://est.vaef.app,https://vaestimating.pages.dev"
 # Who may use the AI service: the signed-in user's email (preferred_username in
 # the MSAL ID token) must be on this list. Comma-separated, case-insensitive.
 # Emails are config, never code — add people here, not in worker.js.
