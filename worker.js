@@ -1,3 +1,4 @@
+import {commercialAuthority,commercialTaskAllowed} from './commercial-auth.js';
 // AH Estimating — Classifier Worker (Cloudflare Workers)
 //
 // Server-side AI gateway for the AH Estimating PWA. The app owns its
@@ -253,7 +254,7 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': corsOrigin || 'null',
       'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Company-Session',
       'Access-Control-Max-Age': '600',
       'X-Worker-Version': VERSION
     };
@@ -282,9 +283,10 @@ export default {
     // own app should never send junk), a ticketless request still passes so
     // the already-deployed app keeps working until it ships tickets.
     const auth = await verifyCaller(request, env);
-    if (!auth.ok && (auth.present || String(env.REQUIRE_AUTH || '') === '1')) {
+    if (!auth.ok && (auth.present || String(env.REQUIRE_AUTH || '') === '1' || parseAllowed(env.COMMERCIAL_ORIGINS || '').includes(origin))) {
       return jsonResponse({ error: auth.message }, 401, corsHeaders);
     }
+    if(parseAllowed(env.COMMERCIAL_ORIGINS || '').includes(origin) && !auth.commercial)return jsonResponse({error:'Open the authorized company workspace before using AI.'},403,corsHeaders);
     let body;
     try { body = await request.json(); }
     catch (e) { return jsonResponse({ error: 'Invalid JSON body' }, 400, corsHeaders); }
@@ -293,6 +295,7 @@ export default {
     // the key via geminiKey(env), whose per-task error tells the human WHERE
     // to fix it (paste it in Settings), which a blanket 500 here never could.
     const { task, payload = {} } = body || {};
+    if(!commercialTaskAllowed(auth,task))return jsonResponse({error:'This company action requires an additional permission.'},403,corsHeaders);
     try {
       let result;
       if (task === 'classify')               result = await doClassify(await geminiKey(env), payload);
@@ -1474,19 +1477,21 @@ async function verifyCaller(request, env) {
   const m = (request.headers.get('Authorization') || '').match(/^Bearer\s+(.+)$/i);
   if (!m) return { ok: false, present: false, message: 'Your sign-in ticket is missing — reload AH Estimating and try again' };
   let claims;
-  try { claims = await verifyIdToken(m[1]); }
+  let commercial=false;
+  try {const peek=b64urlJson(m[1].split('.')[1]);commercial=!!env.COMMERCIAL_CLIENT_ID && peek.aud===env.COMMERCIAL_CLIENT_ID;claims = await verifyIdToken(m[1],commercial ? env.COMMERCIAL_CLIENT_ID:APP_CLIENT_ID); }
   catch (e) { return { ok: false, present: true, message: e.message }; }
   const email = String(claims.preferred_username || claims.email || claims.upn || '').toLowerCase();
   const allowed = parseAllowed(env.EMAIL_ALLOWLIST || '').map(x => x.toLowerCase());
   if (!allowed.length) return { ok: false, present: true, message: 'The AI service has no allow-list configured — tell the admin (EMAIL_ALLOWLIST is empty)' };
   if (!allowed.includes(email)) return { ok: false, present: true, message: `This account (${email || 'unknown'}) is not set up for the AI service — ask the admin to add it` };
+  if(commercial){const authority=await commercialAuthority(request,env,claims,{token:m[1]});return {...authority,email};}
   return { ok: true, present: true, email };
 }
 
 // Verify signature + standard claims; returns the claims or throws with a
 // human-readable message. Signature first would waste a JWKS fetch on an
 // expired ticket, so cheap claim checks run before the crypto.
-async function verifyIdToken(token) {
+async function verifyIdToken(token,expectedAudience=APP_CLIENT_ID) {
   const parts = String(token || '').split('.');
   if (parts.length !== 3) throw new Error('Your sign-in ticket is damaged — reload AH Estimating and sign in again');
   let header, claims;
@@ -1503,7 +1508,7 @@ async function verifyIdToken(token) {
     throw new Error('Your sign-in ticket is not valid yet — check this computer\'s clock');
   }
   if (claims.tid !== TENANT_ID) throw new Error('This sign-in belongs to a different organisation — use your Auzzie Homes account');
-  if (claims.aud !== APP_CLIENT_ID) throw new Error('This sign-in ticket is for a different app — reload AH Estimating and sign in again');
+  if (claims.aud !== expectedAudience) throw new Error('This sign-in ticket is for a different app — reload AH Estimating and sign in again');
   if (claims.iss !== `https://login.microsoftonline.com/${TENANT_ID}/v2.0`) {
     throw new Error('This sign-in ticket did not come from Microsoft sign-in — sign out and back in');
   }
