@@ -173,7 +173,9 @@ import {requireProbeAdmin, validateProbe} from './model-probe.js';
 //           (current)
 //   v0.38 — commercial Microsoft tickets require current company Gate authority,
 //           explicit company binding and independent settings/key permissions.
-const VERSION = 'v0.38';
+//   v0.39 — bounded administrator candidate probes reuse the real model runner.
+//           Production approval remains separate; empty/invalid tests fail closed.
+const VERSION = 'v0.39';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner
