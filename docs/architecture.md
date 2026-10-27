@@ -8,6 +8,7 @@
 ## 请求与响应
 - Endpoint:`POST /`;body `{ task, payload }`;成功 `{ result }`;失败 `{ error }`;全部响应带 `X-Worker-Version`。
 - `runPrompt` payload 支持 `prompt` 或 `messages[{role,text}]`,可带 `images[{base64,mimeType}]` 与 validator 支持子集内的 draft-07 `schema`。
+- `probeModel` is a separate current-settings-admin operation (legacy: valid ticket plus KEY_ADMINS; commercial: live company authorization plus manage_settings). It accepts an explicit provider/model, textIn/imageIn capability, bounded prompt/schema and at most one bounded PNG/JPEG. It uses the same provider adapter and schema validation as runPrompt, but does not require the candidate to be enabled first. It never changes the approved list, assignments, credentials, mailbox or quotes. Invalid/empty output is a failed test. No client payload flag can bypass normal runPrompt approval. Test recipes remain frontend-owned.
 - 有 schema:最多一次纠错重试,回 `{output,outputValid}`;无 schema:回 `{output,raw}`。
 - 管理任务:`setProviderKey{provider:'gemini',apiKey}` 真调 Gemini 成功后才写 KV;`keyStatus` 只回 configured/source/last4/setBy/setAt,永不回 key。
 - 仍在用的辅助任务:`visionAmount/visionOcr/matchBudgetItem`;takeoff 路径:`runMethod/getRecipe/sendCorrection`。固定 prompt 的 `classify/extractAmount/summarizeFilename` 只作暂时兼容。

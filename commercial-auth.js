@@ -14,6 +14,6 @@ export async function commercialAuthority(request,env,claims,{token,fetchImpl=fe
 }
 export function commercialTaskAllowed(auth,task) {
  if(!auth.commercial)return true;
- if(['setProviderKey','keyStatus','setModelAllow','getModelAllow','getRelayKey','setRelayKey'].includes(task))return auth.permissions.includes('manage_settings');
+ if(['probeModel','setProviderKey','keyStatus','setModelAllow','getModelAllow','getRelayKey','setRelayKey'].includes(task))return auth.permissions.includes('manage_settings');
  return auth.permissions.some(p=>['edit_budget','send_email'].includes(p));
 }

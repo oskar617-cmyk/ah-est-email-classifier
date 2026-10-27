@@ -1,4 +1,5 @@
 import {commercialAuthority,commercialTaskAllowed} from './commercial-auth.js';
+import {requireProbeAdmin, validateProbe} from './model-probe.js';
 // AH Estimating — Classifier Worker (Cloudflare Workers)
 //
 // Server-side AI gateway for the AH Estimating PWA. The app owns its
@@ -307,6 +308,7 @@ export default {
       else if (task === 'matchBudgetItem')   result = await doMatchBudgetItem(await geminiKey(env), payload);
       else if (task === 'summarizeFilename') result = await doSummarizeFilename(await geminiKey(env), payload);
       else if (task === 'runPrompt')         result = await doRunPrompt(env, payload);
+      else if (task === 'probeModel')        result = await doProbeModel(env, payload, auth);
       else if (task === 'runMethod')         result = await doRunMethod(env, payload);
       else if (task === 'getRecipe')         result = await doGetRecipe(env, payload);
       else if (task === 'sendCorrection')    result = await doSendCorrection(env, payload);
@@ -1111,6 +1113,22 @@ async function doSetRelayKey(env, p, auth) {
 }
 
 async function doRunPrompt(env, p) {
+  return runPromptOnProvider(env, p, true);
+}
+
+// A separate admin-only entry, never a caller-supplied bypass on runPrompt.
+async function doProbeModel(env, p, auth) {
+  requireProbeAdmin(env, auth);
+  p = validateProbe(p);
+  const started = Date.now();
+  const result = await runPromptOnProvider(env, p, false);
+  if (!result.output || result.outputValid !== true) {
+    const e = new Error('The model did not return valid test output.'); e.status = 422; throw e;
+  }
+  return { ...result, model: p.model, provider: p.provider, elapsedMs: Date.now() - started };
+}
+
+async function runPromptOnProvider(env, p, requireApproval) {
   const contents = contentsOf(p);
   if (!contents) { const e = new Error('prompt or messages required'); e.status = 400; throw e; }
   const schema = (p && p.schema && typeof p.schema === 'object') ? p.schema : null;
@@ -1134,7 +1152,9 @@ async function doRunPrompt(env, p) {
   // not offer a model nobody tested and used; this refuses one that reached the
   // Worker anyway - a browser left open on last week's settings, a copy of the
   // app that never reloaded, or a request that never came from the app at all.
-  await requireApprovedModel(env, provider, model);
+  // Production approval is enforced by doRunPrompt. Candidate tests enter only
+  // after doProbeModel's current-admin and bounded-payload checks.
+  if (requireApproval) await requireApprovedModel(env, provider, model);
   if (provider !== 'gemini') {
     // One shot, no schema retry: the OpenAI-compatible path has no equivalent
     // of Gemini's JSON mode here, so a schema failure is reported honestly
@@ -1394,7 +1414,7 @@ function jsType(d) {
 
 // Exported for offline unit tests (node). Cloudflare only uses `export default`.
 export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
-         doRunPrompt, contentsOf, verifyCaller, verifyIdToken,
+         doRunPrompt, doProbeModel, contentsOf, verifyCaller, verifyIdToken,
          geminiKey, doSetProviderKey, doKeyStatus, bustKeyCache,
          modelFor, geminiUrl, doClassify, doVisionOcr,
          doListModels, validateGeminiKey, doGetRelayKey, doSetRelayKey,
