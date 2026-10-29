@@ -42,3 +42,6 @@
 ## Commercial Company Authorization
 
 Commercial Microsoft tickets are validated against the configured commercial audience, then checked against the current Vaestimating Gate company session. The configured company allow-list, immutable Microsoft tenant/object ID, current permissions and expiry must all agree. Commercial origins require this hard check even while legacy REQUIRE_AUTH remains soft. Provider keys, model-allow lists and relay settings additionally require manage_settings. The existing company KV remains the only key store; enabling the commercial audience does not grant another company access to these keys. Clearing the company enable flag at Gate pauses this path.
+
+## Linked Quotation Documents
+`fetchUrl` retains its legacy preview response. `includeDocument: true` additionally returns bounded original PDF bytes (base64) or complete HTML-derived text and explicit download links. The frontend owns quote recognition, consent gates, ordering and archive identity. No artifact is stored in Worker KV. Requests forward no credentials/cookies, validate every redirect, allow at most four redirects and stream at most 3 MiB within 15 seconds. PDF content must have a PDF signature. Forms, acceptance and payment actions are never executed. Unsupported/login-only portals fail visibly; terms-only filing must not pretend the quotation was captured.

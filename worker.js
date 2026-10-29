@@ -1,3 +1,4 @@
+import { fetchQuoteResource } from './quote-resource.js';
 import {commercialAuthority,commercialTaskAllowed} from './commercial-auth.js';
 import {requireProbeAdmin, validateProbe} from './model-probe.js';
 // AH Estimating — Classifier Worker (Cloudflare Workers)
@@ -893,9 +894,6 @@ async function listOpenAICompatibleModels(env, provider) {
 // Deliberately narrow: http(s) only, no private or loopback hosts, a short
 // timeout, a hard size cap, page content types only. A PDF link is REPORTED as
 // a PDF rather than guessed at.
-const FETCH_URL_TIMEOUT_MS = 15000;
-const FETCH_URL_MAX_BYTES = 3 * 1024 * 1024;
-const FETCH_URL_MAX_CHARS = 12000;
 // Loopback, link-local and the three private IPv4 ranges, plus the hostnames a
 // LAN hands out. Workers cannot reach a private network anyway; this refuses
 // in our own words instead of returning a confusing network error.
@@ -909,7 +907,7 @@ function publicHttpUrl(raw) {
     const e = new Error(`Only web addresses can be opened, not ${u.protocol.replace(':', '')} ones`); e.status = 400; throw e;
   }
   if (u.username || u.password) { const e = new Error('A web address with a password in it is not opened'); e.status = 400; throw e; }
-  if (PRIVATE_HOST.test(u.hostname)) { const e = new Error('That address is on a private network, not the public web'); e.status = 400; throw e; }
+  if (PRIVATE_HOST.test(u.hostname) || u.hostname.includes(':') || /^(0\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|198\.(18|19)\.|192\.0\.|2[2-5]\d\.)/.test(u.hostname) || (u.port && !['80','443'].includes(u.port))) { const e = new Error('That address is on a private network, not the public web'); e.status = 400; throw e; }
   return u;
 }
 
@@ -934,48 +932,7 @@ function htmlToText(html) {
 }
 
 async function doFetchUrl(p) {
-  const u = publicHttpUrl(p && p.url);
-  let res;
-  try {
-    res = await fetch(u.href, {
-      redirect: 'follow',
-      headers: {
-        // Say who we are. A quote page that refuses robots should refuse us by
-        // name rather than be fooled by a borrowed browser string.
-        'User-Agent': 'AH-Estimating-Quote-Reader/1.0 (+https://ah-estimating.pages.dev)',
-        Accept: 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1'
-      },
-      signal: AbortSignal.timeout(FETCH_URL_TIMEOUT_MS)
-    });
-  } catch (err) {
-    const e = new Error(`Could not open that link: ${(err && err.message) || 'no answer'}`); e.status = 502; throw e;
-  }
-  if (!res.ok) {
-    const why = (res.status === 401 || res.status === 403) ? ' — it needs a sign-in we do not have'
-      : res.status === 404 ? ' — that page is gone' : '';
-    const e = new Error(`That link answered ${res.status}${why}`); e.status = res.status; throw e;
-  }
-  const type = String(res.headers.get('content-type') || '').toLowerCase();
-  const finalUrl = res.url || u.href;
-  // A PDF is a real answer, not a failure: the app knows how to read one, but
-  // it has to come down the file road, so say what it is and stop.
-  if (/pdf/.test(type)) return { kind: 'pdf', url: finalUrl, contentType: 'application/pdf', text: '' };
-  if (!/text\/html|xhtml|text\/plain/.test(type)) {
-    const e = new Error(`That link is ${type.split(';')[0] || 'not a page'}, which cannot be read as a quote`); e.status = 415; throw e;
-  }
-  const declared = Number(res.headers.get('content-length') || 0);
-  if (declared && declared > FETCH_URL_MAX_BYTES) { const e = new Error('That page is too big to read'); e.status = 413; throw e; }
-  let raw = '';
-  try { raw = await res.text(); } catch (err) { const e = new Error('That page could not be read as text'); e.status = 502; throw e; }
-  if (raw.length > FETCH_URL_MAX_BYTES) raw = raw.slice(0, FETCH_URL_MAX_BYTES);
-  const titleRaw = (/<title[^>]*>([\s\S]{0,300}?)<\/title>/i.exec(raw) || [])[1] || '';
-  const full = /text\/plain/.test(type) ? raw.replace(/\r\n/g, '\n').trim() : htmlToText(raw);
-  const text = full.slice(0, FETCH_URL_MAX_CHARS);
-  return {
-    kind: 'page', url: finalUrl, contentType: type.split(';')[0],
-    title: htmlToText(titleRaw).slice(0, 200),
-    text, chars: full.length, truncated: full.length > text.length
-  };
+  return fetchQuoteResource(p, { publicHttpUrl, htmlToText });
 }
 
 // ---------- the approved-model list: evidence, not a greyed-out button ------

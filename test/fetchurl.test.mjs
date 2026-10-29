@@ -55,7 +55,7 @@ ok(r.text.includes('System') && r.text.includes('Battery'), 'table cells keep th
 const init = (seen[0] || {}).init || {};
 const headerNames = Object.keys(init.headers || {}).map(h => h.toLowerCase());
 ok(!headerNames.includes('cookie') && !headerNames.includes('authorization'), 'no cookie and no key are sent to the linked site');
-ok(/AH-Estimating-Quote-Reader/.test((init.headers || {})['User-Agent'] || ''), 'we say who we are rather than pretending to be a browser');
+ok(/Vaestimating-Quote-Reader/.test((init.headers || {})['User-Agent'] || ''), 'we say who we are rather than pretending to be a browser');
 
 // ---- 2. a link into our own network is refused, in our words ----------------
 for (const bad of ['http://localhost:8181/admin', 'http://127.0.0.1/x', 'http://192.168.1.50/quote',
@@ -98,3 +98,4 @@ eq(htmlToText(''), '', 'nothing in, nothing out');
 
 console.log(`\nfetchurl: ${pass} pass, ${fail} fail`);
 if (fail) process.exitCode = 1;
+
