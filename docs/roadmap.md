@@ -1,6 +1,7 @@
 ## v0.40 Linked Quotation Evidence (2026-10-30)
 - Approved for release by Oskar. Bounded PDF downloads and full readable quotation pages retain source evidence; unsafe hosts, action links, oversized bodies and redirect chains are rejected. Existing preview clients remain compatible.
-- Syntax and all 20 Node tests pass (including existing grouped runner tests). Live signed App verification follows deployment. No model, key, resource or fee change.
+- Syntax and all 20 Node tests pass (including existing grouped runner tests). Released `574e9ca`; production reports X-Worker-Version:v0.40. Unsupported GET returns 405 and an unsigned fetchUrl request from the allowed origin returns 401.
+- Paired frontend v1.79.0 is live on both Pages targets. Pre-release bounded reader verification retrieved the real Industria original PDF (84,198 bytes); no post-release signed linked-document fetch or new AI Re-Read is claimed. Existing AIRCOOL amount/attachments were inspected read-only, without final quote save. No model, key, resource, fee or supplier-mail change.
 
 # AH Est Email Classifier — 状态与待办
 
