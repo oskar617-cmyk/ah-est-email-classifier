@@ -176,7 +176,8 @@ import {requireProbeAdmin, validateProbe} from './model-probe.js';
 //           explicit company binding and independent settings/key permissions.
 //   v0.39 — bounded administrator candidate probes reuse the real model runner.
 //           Production approval remains separate; empty/invalid tests fail closed.
-const VERSION = 'v0.39';
+//   v0.40 — bounded linked quotation PDFs, full page evidence and validated redirects.
+const VERSION = 'v0.40';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
 // 刻在 Worker 里面的模型"). A model id living in this file is one the app owner

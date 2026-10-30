@@ -1,3 +1,7 @@
+## v0.40 Linked Quotation Evidence (2026-10-30)
+- Approved for release by Oskar. Bounded PDF downloads and full readable quotation pages retain source evidence; unsafe hosts, action links, oversized bodies and redirect chains are rejected. Existing preview clients remain compatible.
+- Syntax and all 20 Node tests pass (including existing grouped runner tests). Live signed App verification follows deployment. No model, key, resource or fee change.
+
 # AH Est Email Classifier — 状态与待办
 
 ## 当前状态

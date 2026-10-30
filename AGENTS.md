@@ -10,7 +10,7 @@
 3. 消费端:ah-estimating 的 `js/runner.js` / `js/ai.js` / `js/classification.js` / `js/methods/` / `js/flywheel.js`
 
 ## 3. Current Snapshot
-以 `worker.js` VERSION 为准(版本史在文件头注释)。当前 **v0.39**：原 AH 通道保留；商业 Microsoft 票须当前 Gate 公司 session、不可变身份、公司白名单和权限同时通过，商业来源不使用 legacy soft fallback；密钥/模型名单/Relay 设置另需 manage_settings。
+以 `worker.js` VERSION 为准(版本史在文件头注释)。当前 **v0.40**：原 AH 通道保留；商业 Microsoft 票须当前 Gate 公司 session、不可变身份、公司白名单和权限同时通过，商业来源不使用 legacy soft fallback；密钥/模型名单/Relay 设置另需 manage_settings。
 
 ## 4. Hard Rules
 - API contract 与 ah-estimating 端锁定:改动必须两 repo 同步。
