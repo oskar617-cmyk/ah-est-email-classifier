@@ -178,7 +178,7 @@ import {requireProbeAdmin, validateProbe} from './model-probe.js';
 //           explicit company binding and independent settings/key permissions.
 //   v0.39 — bounded administrator candidate probes reuse the real model runner.
 //           Production approval remains separate; empty/invalid tests fail closed.
-//   v0.40 — bounded linked quotation PDFs, full page evidence and validated redirects.
+//   v0.41 — bounded linked quotation PDFs, full page evidence and validated redirects.
 const VERSION = 'v0.40';
 
 // THERE IS NO DEFAULT MODEL HERE, deliberately (Oskar 2026-08-06: "我不想要原来
