@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for v0.37: the approved-model list.
 //
 // The point of this list is that the WORKER refuses a model nobody tested and
@@ -62,7 +63,7 @@ store['provider-key:groq'] = JSON.stringify({ apiKey: 'gsk-live' });
 await throws(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'groq', model: 'qwen/qwen3.6-27b' }),
   /not on this app's approved list/, 'runPrompt refuses before it ever calls the provider');
 let called = false;
-globalThis.fetch = async () => { called = true; return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: '{"ok":true}' } }] }), text: async () => '{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}' }; };
+globalThis.fetch = async () => { called = true; return Response.json(normalizeNativeFixture(({ choices: [{ message: { content: '{"ok":true}' } }] })),{status:200}); };
 await run(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'groq', model: 'openai/gpt-oss-120b' }), 'approved runPrompt');
 ok(called, 'an approved model goes through to the provider as before');
 

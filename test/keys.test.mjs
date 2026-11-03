@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for the v0.26 company key store: geminiKey resolution order,
 // setProviderKey (hard gate + validate-before-store) and keyStatus. No
 // Microsoft, no Gemini, no KV — same stub pattern as auth.test.mjs: mint our
@@ -45,12 +46,13 @@ let geminiCalls = 0;
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url) => {
   const u = String(url);
-  if (u.includes('/discovery/v2.0/keys')) return { ok: true, json: async () => ({ keys: [jwk] }) };
+  if (u.includes('/discovery/v2.0/keys')) return Response.json(normalizeNativeFixture(({ keys: [jwk] })),{status:200});
   if (u.includes('generativelanguage.googleapis.com')) {
     geminiCalls++;
     const s = geminiScript.length ? geminiScript.shift() : { ok: true, text: '{"ok":true}' };
     if (!s.ok) return { ok: false, status: s.status || 400, text: async () => s.body || 'boom' };
-    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text: s.text }] } }] }) };
+    if(u.includes('/models?'))return Response.json({models:[]});
+    return Response.json(normalizeNativeFixture(({ candidates: [{ content: { parts: [{ text: s.text }] } }] })),{status:200});
   }
   throw new Error('unexpected fetch in test: ' + u);
 };
@@ -123,7 +125,7 @@ ok(geminiCalls === callsBefore, 'refused candidates never reach Gemini');
 const recBefore = store['provider-key:gemini'];
 geminiScript = [{ ok: false, status: 400, body: 'API key not valid. Please pass a valid API key.' }];
 await throws(() => doSetProviderKey(env, { provider: 'gemini', apiKey: 'AIzaDeadCandidateKey0000' }, authAdmin),
-  /NOT saved.*API key not valid/, 'dead candidate -> refused with the provider\'s real reason');
+  /NOT saved.*RELAY_PROVIDER_HTTP_400/, 'dead candidate -> refused with the provider\'s real reason');
 ok(store['provider-key:gemini'] === recBefore, 'the working key is untouched after a failed validation');
 
 // ---- end-to-end through the fetch handler: the gate holds in soft mode ----

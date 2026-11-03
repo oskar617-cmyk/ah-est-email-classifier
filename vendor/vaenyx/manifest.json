@@ -1,0 +1,19 @@
+{
+  "name": "vaenyx-relay-client",
+  "version": "1.4.0",
+  "files": {
+    "client.mjs": "f3e5e8cbc6d7fb068d88e3eb1464ef4c7dae75e2a4f10f951d61fb18b80d9697",
+    "connect.mjs": "66d00624bc9533534cd7f12585bdc4f0644e7c8b15c5cdb5e59710f098dbe25b",
+    "protocol.mjs": "ed31e666081a974cd89ebb49aaf1b743192426e1f11ab5114461ea7e22403949",
+    "vault.mjs": "6a5a0d65cafc1f4b7b91e7704d5948be3a41f9ca39444e026d6b46fda3db9ab0",
+    "return.mjs": "481fcb51fd090a52c606c1795e64f7b9f3b9131f09674de365b872efea741e00",
+    "provider-definitions.mjs": "e1ad3903fcd1ff8620e54957a7b557f9411b26df2d821d92d631e2fe69458182",
+    "provider-wire.mjs": "b48bc8b826f66d414b5d6eca14dde292871c17c0869eb80441e7bfbf080c083d",
+    "providers.mjs": "a3545067387cd81d41c9275881c80435e7a34ba687aae46edd874dc01b63f884",
+    "search.mjs": "1d63101dd0ff8e81476c99e1591a90bd15397bf6ebdb358340127b9e12ac64f6",
+    "direct.mjs": "d86a43de016a422c466317af08d1f7c331758bbf29fe48425d5a548dddf60e61",
+    "routes.mjs": "3314d822d84c33f2c26c26a13bf9605cd82b18c3a14b74de75ce569a9e0b27c6",
+    "journal.mjs": "5ada83875e29c29f7ab32712eedb955ad7dbaafafc5267129dcefeec7d043006",
+    "files.mjs": "3b3b552b8a320eba8e55e93322822c1e409911d01afdc0eb4f2606e56e1d9cac"
+  }
+}

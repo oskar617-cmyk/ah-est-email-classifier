@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { doProbeModel, doRunPrompt } from '../worker.js';
@@ -10,7 +11,7 @@ const env = { KEY_ADMINS: admin.email, KEYS: { get: async k => k === 'model-allo
 test('candidate test uses selected provider without approving or assigning it', async () => {
   writes = 0; calls = 0;
   const old = globalThis.fetch;
-  globalThis.fetch = async (_url, init) => { calls++; assert.equal(JSON.parse(init.body).model, payload.model); return Response.json({ choices: [{ message: { content: '{"ok":true}' } }] }); };
+  globalThis.fetch = async (_url, init) => { calls++; assert.equal(JSON.parse(init.body).model, payload.model); return Response.json(normalizeNativeFixture({ choices: [{ message: { content: '{"ok":true}' } }] })); };
   try {
     const r = await doProbeModel(env, payload, admin);
     assert.equal(r.output.ok, true); assert.equal(r.model, payload.model); assert.equal(calls, 1); assert.equal(writes, 0);
@@ -34,7 +35,7 @@ test('empty and schema-invalid model replies cannot pass a picture test', async 
   const old = globalThis.fetch;
   try {
     for (const output of ['null', '{"wrong":true}']) {
-      globalThis.fetch = async () => Response.json({ choices: [{ message: { content: output } }] });
+      globalThis.fetch = async () => Response.json(normalizeNativeFixture({ choices: [{ message: { content: output } }] }));
       await assert.rejects(doProbeModel(env, { ...payload, capability: 'imageIn', images: [{ base64: 'AAAA', mimeType: 'image/png' }] }, commercial), { status: 422 });
     }
   } finally { globalThis.fetch = old; }

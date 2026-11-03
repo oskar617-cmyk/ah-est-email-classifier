@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline unit tests for the Mode-B method runner logic (no Gemini, no network
 // except a stubbed fetch). Run: node test/runner.test.mjs
 import { buildMethodPrompt, validateOutput, getRecipe } from '../worker.js';
@@ -53,7 +54,7 @@ const realFetch = globalThis.fetch;
 globalThis.fetch = async () => ({ status: 409, ok: false, text: async () => 'changed' });
 await throws(() => getRecipe('live-409-method', { VANTA_BASE: 'https://x', VANTA_APP_TOKEN: 't' }),
   e => e.status === 409, 'Vanta 409 -> throws status 409 (re-auth)');
-globalThis.fetch = async () => ({ status: 200, ok: true, json: async () => ({ id: 'live-ok-method', version: '2.0.0', recipe: 'r', outputSchema: { type: 'object' }, examples: [] }) });
+globalThis.fetch = async () => (Response.json(normalizeNativeFixture(({ id: 'live-ok-method', version: '2.0.0', recipe: 'r', outputSchema: { type: 'object' }, examples: [] })),{status:200}));
 const live = await getRecipe('live-ok-method', { VANTA_BASE: 'https://x', VANTA_APP_TOKEN: 't' });
 ok(live && live.id === 'live-ok-method' && live.version === '2.0.0', 'live fetch returns the fetched pack');
 globalThis.fetch = realFetch;

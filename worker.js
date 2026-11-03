@@ -1,3 +1,5 @@
+import {createDirectClient} from './vendor/vaenyx/direct.mjs';
+import {API_PROVIDERS} from './vendor/vaenyx/provider-definitions.mjs';
 import { fetchQuoteResource } from './quote-resource.js';
 import {commercialAuthority,commercialTaskAllowed} from './commercial-auth.js';
 import {requireProbeAdmin, validateProbe} from './model-probe.js';
@@ -233,11 +235,11 @@ function modelFor(p, provider) {
 
 // One place that builds a Gemini generateContent URL, so no call site can quietly
 // go model-less: an absent model throws here instead of producing ".../models/:generateContent".
-function geminiUrl(model, apiKey) {
+function geminiUrl(model) {
   const m = String(model || '').trim();
   if (!m) throw new Error('Internal: a Gemini call was made without a model. The caller must name one.');
   return 'https://generativelanguage.googleapis.com/v1beta/models/' + m + ':generateContent'
-    + '?key=' + encodeURIComponent(apiKey);
+    ;
 }
 
 import { FIXTURES } from './fixtures.js';
@@ -291,7 +293,7 @@ export default {
     // the already-deployed app keeps working until it ships tickets.
     const auth = await verifyCaller(request, env);
     if (!auth.ok && (auth.present || String(env.REQUIRE_AUTH || '') === '1' || parseAllowed(env.COMMERCIAL_ORIGINS || '').includes(origin))) {
-      return jsonResponse({ error: auth.message }, 401, corsHeaders);
+      return jsonResponse({ error: auth.message,code:"authentication_required",execution_started:false }, 401, corsHeaders);
     }
     if(parseAllowed(env.COMMERCIAL_ORIGINS || '').includes(origin) && !auth.commercial)return jsonResponse({error:'Open the authorized company workspace before using AI.'},403,corsHeaders);
     let body;
@@ -335,13 +337,13 @@ export default {
       // The key-store tasks gate HARD inside the handler (soft mode does not
       // apply to them) — let their 401/403 out with the human message intact.
       if (err && (err.status === 401 || err.status === 403)) {
-        return jsonResponse({ error: err.message }, err.status, corsHeaders);
+        return jsonResponse({ error: err.message,execution_started:err.unknown===true,outcome_unknown:err.unknown===true }, err.status, corsHeaders);
       }
       if (err && err.status === 400) {
-        return jsonResponse({ error: (err.message) || 'Bad request' }, 400, corsHeaders);
+        return jsonResponse({ error: (err.message) || 'Bad request',execution_started:err.unknown===true,outcome_unknown:err.unknown===true }, 400, corsHeaders);
       }
       console.error('Worker task failed:', err && err.stack || err);
-      return jsonResponse({ error: (err && err.message) || 'Worker error' }, 500, corsHeaders);
+      return jsonResponse({ error: (err && err.message) || 'Worker error',execution_started:err?.unknown!==false,outcome_unknown:err?.unknown!==false }, 500, corsHeaders);
     }
   }
 };
@@ -456,7 +458,7 @@ async function doVisionOcr(apiKey, p) {
   const media = mediaFromPayload(p);
   if (!media.length) { const e = new Error('fileBase64 or images required'); e.status = 400; throw e; }
   const prompt = `Transcribe ALL the text you can read in this image/scan, VERBATIM. Preserve line breaks and every number exactly as shown, including dollar amounts and labels like "Total", "Subtotal", "GST", "incl GST", "ex GST", "+ GST". Do not summarise, correct, translate, or add anything. If there is no readable text, return an empty string. Respond with STRICT JSON only: {"text":"<the transcribed text>"}`;
-  const raw = await callGeminiVision(apiKey, prompt, media, modelFor(p));
+  const raw = await callGeminiVision(apiKey, prompt, media, modelFor(p),'vision_analysis');
   const json = parseJson(raw);
   return { text: (json && typeof json.text === 'string') ? json.text : (typeof raw === 'string' ? raw : '') };
 }
@@ -572,13 +574,8 @@ async function readKeyRecord(env, provider) {
 // 🔴 This table and the app's WORKER_PROVIDERS must agree. The app routes a job
 // here based on its own list; a provider named there and missing here arrives
 // as "unknown provider" instead of running, so add to both or neither.
-const OPENAI_COMPATIBLE = {
-  groq:       { label: 'Groq',       baseUrl: 'https://api.groq.com/openai/v1' },
-  openrouter: { label: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1' },
-  cerebras:   { label: 'Cerebras',   baseUrl: 'https://api.cerebras.ai/v1' },
-  deepseek:   { label: 'DeepSeek',   baseUrl: 'https://api.deepseek.com/v1' },
-  mistral:    { label: 'Mistral',    baseUrl: 'https://api.mistral.ai/v1' }
-};
+const OPENAI_COMPATIBLE=Object.fromEntries(['groq','openrouter','cerebras','deepseek','mistral'].map(id=>{const p=API_PROVIDERS.find(p=>p.id===id);return [id,{label:p.name,baseUrl:p.base}];}));
+
 const KNOWN_PROVIDERS = new Set(['gemini', ...Object.keys(OPENAI_COMPATIBLE)]);
 const kvKeyFor = provider => `provider-key:${provider}`;
 
@@ -604,61 +601,11 @@ function textOf(contents) {
     .filter(Boolean).join('\n\n');
 }
 
-async function callOpenAICompatible(provider, apiKey, model, prompt, media) {
-  const cfg = OPENAI_COMPATIBLE[provider];
-  if (!cfg) { const e = new Error(`Unknown provider "${provider}"`); e.status = 400; throw e; }
-  const content = (Array.isArray(media) && media.length)
-    ? [{ type: 'text', text: prompt },
-       ...media.filter(m => m && m.data).map(m => ({ type: 'image_url',
-         image_url: { url: `data:${m.mimeType || 'image/png'};base64,${m.data}` } }))]
-    : prompt;
-  let res;
-  try {
-    res = await fetch(`${cfg.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-      // max_tokens is SAID, not left to the provider: Groq charges a request's
-      // output allowance against a per-minute output budget BEFORE answering,
-      // and with none set it assumes the model's own maximum.
-      // MEASURED on our free account 2026-09-16, not read off a docs table:
-      // qwen/qwen3.6-27b is capped at 1,000 output tokens a minute and refuses
-      // every call at this size - unusable here; openai/gpt-oss-120b read a
-      // full-length quote in 7s (answer ~1,750 tokens); qwen3.8 answered
-      // nothing. 4,096 matches the app's Direct path and leaves a thinking
-      // model room to finish.
-      body: JSON.stringify({ model, temperature: 0, max_tokens: 4096, messages: [{ role: 'user', content }] })
-    });
-  } catch (err) {
-    const e = new Error(`${cfg.label} could not be reached: ${err && err.message}`); e.status = 502; throw e;
-  }
-  // Read the body ONCE as text, then try to parse. res.json() on a refusal that
-  // is not JSON (an edge/proxy page, a bare status) threw, got swallowed by the
-  // .catch, and left `null` — so the provider's actual reason was replaced by a
-  // bare "HTTP 402", which tells you nothing you can act on.
-  let raw = '';
-  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
-  let body = null;
-  try { body = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
-  if (!res.ok) {
-    // The provider's OWN words. A generic "call failed" costs an hour of
-    // guessing at which of the key, the model id or the quota is wrong.
-    const said = (body && body.error && (body.error.message || body.error))
-      || (body && (body.message || body.detail))
-      || raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-    // What the STATUS means, when the body says nothing useful. These are the
-    // HTTP meanings, not a claim about the account — a bare number is useless to
-    // whoever is holding the key and wondering what to fix.
-    const meaning = { 401: 'the key was not accepted', 402: 'payment required — that account needs billing or credits set up',
-      403: 'the key is valid but not allowed to do this', 404: 'no such model on this account',
-      429: 'rate limit or free quota reached' }[res.status];
-    const why = said ? String(said).slice(0, 300) : (meaning ? `HTTP ${res.status} — ${meaning}` : `HTTP ${res.status}`);
-    const suffix = (said && meaning) ? ` (HTTP ${res.status} — ${meaning})` : '';
-    const e = new Error(`${cfg.label} refused: ${why}${suffix}`); e.status = res.status; throw e;
-  }
-  const text = body && body.choices && body.choices[0] && body.choices[0].message
-    ? body.choices[0].message.content : '';
-  return typeof text === 'string' ? text : '';
+async function sharedCall(provider,apiKey,model,prompt,media=[],messages,capability){
+ try{return (await createDirectClient({provider,apiKey,timeoutMs:90000}).run({model,prompt,capability:capability||(provider==='gemini'?'structured_output':'text_analysis'),requirements:provider==='gemini'?{}:{max_output_tokens:4096,temperature:0}}, {attachments:messages?[]:(media||[]).filter(m=>m?.data).map(m=>({name:'document',mime:m.mimeType||'image/png',base64:m.data})),messages})).text;}
+ catch(error){const status=Number(String(error.code||'').match(/HTTP_(\d+)$/)?.[1])||error.status||502;const label=API_PROVIDERS.find(p=>p.id===provider)?.name||provider;const meaning={401:'the key was not accepted',402:'Payment Required — billing or credits are needed',403:'the key is not allowed to do this',404:'model unavailable',429:'rate limit or free quota reached'}[status];const safe=new Error(label+' failed: '+String(error.code||'outcome_unknown')+(meaning?' · '+meaning:''));safe.status=status;safe.unknown=error.unknown!==false;throw safe;}
 }
+async function callOpenAICompatible(provider,apiKey,model,prompt,media){if(!OPENAI_COMPATIBLE[provider]){const e=new Error('Unknown provider');e.status=400;throw e;}return sharedCall(provider,apiKey,model,prompt,media);}
 
 // The 60s cache would otherwise keep serving the OLD key for up to a minute
 // on the isolate that just stored a new one — bust it so a rotation is live
@@ -812,72 +759,7 @@ const GOOGLE_MODELS_URL = 'https://generativelanguage.googleapis.com/v1beta/mode
 // before; every OpenAI-compatible provider answers GET /models with the same
 // shape they all copied from OpenAI, so Groq (and the rest of the table) can
 // be asked with the company key too. Still names only - never capability.
-async function doListModels(env, p) {
-  const provider = (p && typeof p.provider === 'string' && p.provider.trim()) || 'gemini';
-  if (provider !== 'gemini') return listOpenAICompatibleModels(env, provider);
-  const apiKey = await geminiKey(env);
-  const out = [];
-  let pageToken = '';
-  // Default page size is 50 and Google is well past that (every -001/-002
-  // variant, embeddings, imagen, veo, tts). Asking for 50 silently truncates
-  // the list, which reads as "the API is broken" rather than "page 2 exists".
-  for (let page = 0; page < 6; page++) {
-    const url = `${GOOGLE_MODELS_URL}?pageSize=1000${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
-    let res;
-    // The key goes in a HEADER, not the query string: a URL carries into logs,
-    // history and referrers, and this one is the company's.
-    try { res = await fetch(url, { headers: { 'x-goog-api-key': apiKey } }); }
-    catch (err) { const e = new Error(`Could not reach Google to list models: ${err && err.message}`); e.status = 502; throw e; }
-    const body = await res.json().catch(() => null);
-    if (!res.ok) {
-      const why = (body && body.error && body.error.message) || `HTTP ${res.status}`;
-      const e = new Error(`Google refused the model list — ${why}`); e.status = res.status; throw e;
-    }
-    for (const m of ((body && body.models) || [])) {
-      // Only things you can actually hold a conversation with. Without this the
-      // dropdown fills up with embedding, image and speech models.
-      if (!((m.supportedGenerationMethods || []).includes('generateContent'))) continue;
-      const id = String(m.name || '').replace(/^models\//, '');
-      if (!id) continue;
-      // Every field but the id is optional — a missing displayName must never
-      // drop the model, only fall back to its id.
-      out.push({ id, label: m.displayName || id, description: m.description || '',
-        inputTokenLimit: m.inputTokenLimit || null });
-    }
-    pageToken = (body && body.nextPageToken) || '';
-    if (!pageToken) break;
-  }
-  return { provider: 'gemini', models: out, fetchedAt: new Date().toISOString() };
-}
-
-// GET {baseUrl}/models for an OpenAI-compatible provider: { data: [{ id,
-// owned_by?, active? }] }. Inactive entries are dropped (Groq marks retired
-// models active:false rather than removing them).
-async function listOpenAICompatibleModels(env, provider) {
-  const cfg = OPENAI_COMPATIBLE[provider];
-  if (!cfg) { const e = new Error(`"${String(provider).slice(0, 40)}" is not a provider this Worker can list`); e.status = 400; throw e; }
-  const key = await providerKey(env, provider);
-  let res;
-  try { res = await fetch(`${cfg.baseUrl}/models`, { headers: { Authorization: `Bearer ${key}` } }); }
-  catch (err) { const e = new Error(`Could not reach ${cfg.label} to list models: ${err && err.message}`); e.status = 502; throw e; }
-  let raw = '';
-  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
-  let body = null;
-  try { body = raw ? JSON.parse(raw) : null; } catch { /* not JSON */ }
-  if (!res.ok) {
-    const why = (body && body.error && (body.error.message || body.error)) || raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || `HTTP ${res.status}`;
-    const e = new Error(`${cfg.label} refused the model list — ${String(why).slice(0, 300)}`); e.status = res.status; throw e;
-  }
-  const out = [];
-  for (const m of ((body && body.data) || [])) {
-    const id = String((m && m.id) || '').trim();
-    if (!id || (m && m.active === false)) continue;
-    out.push({ id, label: id, ownedBy: (m && m.owned_by) || '', contextWindow: (m && m.context_window) || null });
-  }
-  // The provider is echoed so an app talking to an OLDER Worker (which ignored
-  // the field and answered with Google's list) can tell the difference.
-  return { provider, models: out, fetchedAt: new Date().toISOString() };
-}
+async function doListModels(env,p){const provider=p?.provider||'gemini';if(!KNOWN_PROVIDERS.has(provider)){const e=new Error('Unknown provider: not a provider this Worker can list');e.status=400;throw e;}const key=provider==='gemini'?await geminiKey(env):await providerKey(env,provider);const rows=await createDirectClient({provider,apiKey:key,timeoutMs:20000}).models();return {provider,models:rows.filter(m=>m.selectable).map(m=>({id:m.id,label:m.display_name||m.id,description:m.description||'',inputTokenLimit:m.inputTokenLimit||null,ownedBy:m.ownedBy||'',contextWindow:m.contextWindow||null})),fetchedAt:new Date().toISOString()};}
 
 // ---------- fetchUrl: read a PUBLIC page a supplier linked to ----------
 //
@@ -1001,20 +883,7 @@ async function doGetModelAllow(env, p, auth) {
 // Is this key real? Asks Google to list the models the key can see — the same
 // endpoint as above, but with a CANDIDATE key rather than the stored one, and
 // only the verdict matters. Throws with Google's own message when it does not.
-async function validateGeminiKey(apiKey) {
-  let res;
-  try { res = await fetch(`${GOOGLE_MODELS_URL}?pageSize=1`, { headers: { 'x-goog-api-key': apiKey } }); }
-  catch (err) { throw new Error(`could not reach Google to check it: ${(err && err.message) || 'no answer'}`); }
-  if (res.ok) return true;
-  // Read it as TEXT and then try to parse. A refusal is not always JSON — an
-  // edge/proxy error is often HTML, and res.json() would throw on it, replacing
-  // Google's actual reason with a parser message.
-  let raw = '';
-  try { raw = typeof res.text === 'function' ? await res.text() : ''; } catch { /* keep the status */ }
-  let msg = '';
-  try { msg = (JSON.parse(raw).error || {}).message || ''; } catch { /* not JSON */ }
-  throw new Error(msg || raw.slice(0, 200) || `Google answered HTTP ${res.status}`);
-}
+async function validateGeminiKey(apiKey){await createDirectClient({provider:'gemini',apiKey,timeoutMs:20000}).models();return true;}
 
 // ---------- the app's Vaenyx relay key ----------
 //
@@ -1131,16 +1000,7 @@ async function runPromptOnProvider(env, p, requireApproval) {
   if (!schema) return { output, raw };
 
   let errs = validateOutput(output, schema);
-  if (errs.length) {
-    // One conversational retry: show the model its own answer and the errors.
-    const retry = contents.concat([
-      { role: 'model', parts: [{ text: raw || '' }] },
-      { role: 'user', parts: [{ text: `Your previous answer failed validation: ${errs.slice(0, 5).join('; ')}. Return CORRECTED strict JSON only that matches the schema.` }] }
-    ]);
-    raw = await geminiGenerate(apiKey, retry, model);
-    output = parseJson(raw);
-    errs = validateOutput(output, schema);
-  }
+
   return { output: output != null ? output : null, outputValid: errs.length === 0 };
 }
 
@@ -1169,23 +1029,7 @@ function contentsOf(p) {
 // Low-level Gemini call taking prepared `contents` (multi-turn capable). The
 // older callGemini/callGeminiVision keep their own request-building untouched —
 // every pre-embed task keeps its exact behaviour until it is retired.
-async function geminiGenerate(apiKey, contents, model) {
-  const url = geminiUrl(model, apiKey);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents,
-      generationConfig: { temperature: 0.1, responseMimeType: 'application/json' }
-    })
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
+async function geminiGenerate(apiKey,contents,model){const messages=contents.map(c=>({role:c.role==='model'?'assistant':'user',text:(c.parts||[]).map(p=>p.text||'').filter(Boolean).join('\n'),files:(c.parts||[]).map(p=>p.inlineData||p.inline_data).filter(Boolean).map(m=>({name:'document',mime:m.mimeType||m.mime_type||'image/png',base64:m.data}))}));return sharedCall('gemini',apiKey,model,'',[],messages);}
 
 // ---------- runMethod: Vanta Mode-B recipe runner ----------
 //
@@ -1215,13 +1059,6 @@ async function doRunMethod(env, p) {
 
   let output = parseJson(await ask(prompt));
   let errs = validateOutput(output, pack.outputSchema);
-  if (errs.length) {
-    const retry = prompt +
-      `\n\nYour previous answer failed validation: ${errs.slice(0, 5).join('; ')}. ` +
-      `Return CORRECTED strict JSON only that matches the schema.`;
-    output = parseJson(await ask(retry));
-    errs = validateOutput(output, pack.outputSchema);
-  }
 
   return {
     output: output != null ? output : null,
@@ -1387,53 +1224,8 @@ export { buildMethodPrompt, validateOutput, getRecipe, doRunMethod,
 
 // model = the caller's choice, already resolved by modelFor(). It is REQUIRED:
 // there is no default left in this file to fall back to.
-async function callGemini(apiKey, prompt, model) {
-  const url = geminiUrl(model, apiKey);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.1,
-        responseMimeType: 'application/json'
-      }
-    })
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Gemini ${res.status}: ${t.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  // Standard response shape: { candidates: [{ content: { parts: [{ text: "..." }] } }] }
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  return text || '';
-}
-
-// Gemini vision call: same model, but the file (PDF/image) rides along as
-// inline_data so the model can READ a scan/photo that has no text layer.
-// media = array of { data (base64), mimeType }. One or more page images / a file.
-async function callGeminiVision(apiKey, prompt, media, model) {
-  const parts = [{ text: prompt }];
-  for (const m of (Array.isArray(media) ? media : [])) {
-    if (m && m.data) parts.push({ inline_data: { mime_type: m.mimeType || 'application/pdf', data: m.data } });
-  }
-  const url = geminiUrl(model, apiKey);
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      generationConfig: { temperature: 0, responseMimeType: 'application/json' }
-    })
-  });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`Gemini vision ${res.status}: ${t.slice(0, 300)}`);
-  }
-  const data = await res.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-}
+async function callGemini(apiKey,prompt,model){return sharedCall('gemini',apiKey,model,prompt);}
+async function callGeminiVision(apiKey,prompt,media,model,capability){return sharedCall('gemini',apiKey,model,prompt,media,undefined,capability);}
 
 // ---------- sign-in gate (MSAL ID token) ----------
 //

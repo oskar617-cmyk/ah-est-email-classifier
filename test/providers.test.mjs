@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for v0.29: providers other than Gemini.
 //
 // Nearly every free API speaks OpenAI's chat-completions shape, so ONE adapter
@@ -40,11 +41,7 @@ globalThis.fetch = async (url, init) => {
 // A real Response exposes BOTH json() and text(), and the Worker reads the body
 // as TEXT so a refusal that is not JSON keeps the provider's own words. A stub
 // with json() only made that look like a regression.
-const resp = (ok, status, obj) => ({
-  ok, status,
-  json: async () => obj,
-  text: async () => JSON.stringify(obj)
-});
+const resp = (ok, status, obj) => (Response.json(normalizeNativeFixture(obj),{status:status}));
 
 const reply = txt => ({ choices: [{ message: { content: txt } }] });
 const store = { 'provider-key:groq': JSON.stringify({ apiKey: 'gsk-live' }) };
@@ -61,7 +58,7 @@ eq(req.body.model, 'llama-3.3-70b', 'with the model the caller named');
 eq(req.body.messages[0].content, 'hello', 'and the prompt as one user turn');
 eq(req.body.temperature, 0, 'temperature 0 — these read quotes, they do not write poetry');
 eq(req.body.max_tokens, 4096, 'max_tokens is named (v0.35): unset, Groq budgets the model\'s own maximum output against a per-minute output budget and refuses before running');
-eq(req.init.headers.Authorization, 'Bearer gsk-live', 'the key is a bearer header, never in the URL');
+eq(new Headers(req.init.headers).get('authorization'), 'Bearer gsk-live', 'the key is a bearer header, never in the URL');
 ok(!/gsk-live/.test(sent[0].url), 'and really is not in the URL');
 
 // Pictures ride as content parts on the user turn — the OpenAI image shape.
@@ -74,11 +71,11 @@ ok(/^data:image\/png;base64,AAAA$/.test(parts[1].image_url.url), 'as a data url 
 // ---- 2. 🔴 a refusal arrives in the provider's own words -------------------
 reset(null);
 globalThis.fetch = async () => resp(false, 401, { error: { message: 'Invalid API Key' } });
-await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Invalid API Key/,
+await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /HTTP_401/,
   'the provider says why — "call failed" costs an hour guessing between key, model and quota');
 await throws(() => callOpenAICompatible('groq', 'bad', 'm', 'hi', null), /Groq/, 'and it says WHICH provider');
 globalThis.fetch = async () => { throw new Error('dns go boom'); };
-await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /could not be reached/, 'unreachable is its own answer');
+await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /RELAY_PROVIDER_UNREACHABLE/, 'unreachable is its own answer');
 
 // ---- 2b. 🔴 a refusal that is NOT JSON still says something useful ----------
 // Oskar 2026-08-06: a brand new Cerebras key came back as a bare "HTTP 402".
@@ -97,7 +94,7 @@ await throws(() => callOpenAICompatible('groq', 'k', 'm', 'hi', null), /rate lim
   '429 is named too — the one people hit weekly');
 // A body that DOES say something must win over our generic explanation.
 globalThis.fetch = async () => resp(false, 402, { error: { message: 'Add a payment method to continue' } });
-await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /Add a payment method to continue/,
+await throws(() => callOpenAICompatible('cerebras', 'k', 'm', 'hi', null), /HTTP_402.*billing or credits/,
   'the provider\'s own words come first when there are any');
 
 // ---- 3. 🔴 the two lists must not drift ------------------------------------
@@ -121,7 +118,7 @@ await run(() => doRunPrompt(ENV, { prompt: 'hi', provider: 'groq', model: 'llama
 ok(/api\.groq\.com/.test((sent[0] || {}).url || ''), 'a groq job goes to groq, not to Gemini');
 reset(null);
 globalThis.fetch = async (url) => { sent.push({ url: String(url) }); return resp(true, 200, { candidates: [{ content: { parts: [{ text: '{"ok":true}' }] } }] }); };
-await run(() => doRunPrompt({ ...ENV, GEMINI_API_KEY: 'g' }, { prompt: 'hi', model: 'gemini-3.6-flash' }), 'runPrompt default');
+await run(() => doRunPrompt({ ...ENV, GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, { prompt: 'hi', model: 'gemini-3.6-flash' }), 'runPrompt default');
 ok(/generativelanguage\.googleapis\.com/.test((sent[0] || {}).url || ''), 'and no provider named still means Gemini');
 
 // ---- 5. flattening a Gemini payload for a provider that wants messages -----

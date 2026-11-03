@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for v0.28: listModels + the shared Vaenyx relay key.
 //
 // Two jobs that both serve "set it once, every device has it":
@@ -49,7 +50,7 @@ let reply = null, seen = [];
 globalThis.fetch = async (url, init) => {
   seen.push({ url: String(url), headers: (init && init.headers) || {} });
   if (typeof reply === 'function') return reply();
-  return { ok: true, status: 200, json: async () => reply };
+  return Response.json(normalizeNativeFixture(reply),{status:200});
 };
 const ADMIN = { ok: true, email: 'oskar@auhs.com.au' };
 const USER = { ok: true, email: 'est@auhs.com.au' };
@@ -94,20 +95,20 @@ globalThis.fetch = async (url) => {
   calls++;
   const first = calls === 1;
   seen.push({ url: String(url), headers: {} });
-  return { ok: true, status: 200, json: async () => first
+  return Response.json(normalizeNativeFixture(first
     ? { models: [model('models/a', ['generateContent'])], nextPageToken: 'PAGE2' }
-    : { models: [model('models/b', ['generateContent'])] } };
+    : { models: [model('models/b', ['generateContent'])] }),{status:200});
 };
 r = await run(() => doListModels(ENV), 'listModels paging');
 eq(r.models.map(m => m.id), ['a', 'b'], 'every page is collected, not just the first');
 ok(/pageToken=PAGE2/.test((seen[1] || {}).url || ''), 'and the token is passed back');
 
 // Google saying no is reported in Google's words, not swallowed into an empty list.
-globalThis.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: { message: 'API key not valid' } }) });
-await throws(() => doListModels(ENV), /API key not valid/, 'Google\'s own reason is passed through');
+globalThis.fetch = async () => (Response.json(normalizeNativeFixture(({ error: { message: 'API key not valid' } })),{status:400}));
+await throws(() => doListModels(ENV), /RELAY_PROVIDER_HTTP_400/, 'Google\'s own reason is passed through');
 
 // ---- 2. 🔴 who may collect the relay key -----------------------------------
-globalThis.fetch = async () => ({ ok: true, json: async () => ({}) });
+globalThis.fetch = async () => (Response.json(normalizeNativeFixture(({})),{status:200}));
 reset(null);
 await run(() => doSetRelayKey(ENV, { token: 'vaenyx_app_abcdefghijklmnop' }, ADMIN), 'setRelayKey');
 eq((await run(() => doGetRelayKey(ENV, {}, USER), 'getRelayKey')).token, 'vaenyx_app_abcdefghijklmnop',
@@ -151,14 +152,14 @@ globalThis.fetch = async (url, init) => {
     { id: 'llama-4-scout', owned_by: 'Meta', active: false },
     { id: 'whisper-large-v3', owned_by: 'OpenAI', active: true }
   ] };
-  return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) };
+  return Response.json(normalizeNativeFixture(body),{status:200});
 };
 r = await run(() => doListModels(ENV, { provider: 'groq' }), 'listModels groq');
 eq(r.models.map(m => m.id), ['qwen/qwen3.8-27b', 'whisper-large-v3'], 'active models come back under their ids; a retired one (active:false) is dropped');
 ok(/api\.groq\.com\/openai\/v1\/models$/.test((seen[0] || {}).url || ''), 'asked at that provider\'s /models endpoint');
-eq(((seen[0] || {}).headers || {}).Authorization, 'Bearer gsk-live', 'with the company key as a Bearer header');
-globalThis.fetch = async () => ({ ok: false, status: 401, json: async () => ({ error: { message: 'Invalid API Key' } }), text: async () => JSON.stringify({ error: { message: 'Invalid API Key' } }) });
-await throws(() => doListModels(ENV, { provider: 'groq' }), /Groq refused the model list — Invalid API Key/, 'a refusal carries the provider\'s own words');
+eq(new Headers((seen[0]||{}).headers||{}).get('authorization'), 'Bearer gsk-live', 'with the company key as a Bearer header');
+globalThis.fetch = async () => (Response.json(normalizeNativeFixture(({ error: { message: 'Invalid API Key' } })),{status:401}));
+await throws(() => doListModels(ENV, { provider: 'groq' }), /RELAY_PROVIDER_HTTP_401/, 'a refusal carries the provider\'s own words');
 await throws(() => doListModels(ENV, { provider: 'nosuch' }), /not a provider this Worker can list/, 'an unknown provider is refused, not guessed at');
 
 console.log(`\ncatalog: ${pass} pass, ${fail} fail`);

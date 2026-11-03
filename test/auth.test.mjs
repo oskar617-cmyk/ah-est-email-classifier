@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for the v0.25 additions: the sign-in gate and runPrompt.
 // No Microsoft, no Gemini — we mint our own RS256 key, publish it through a
 // stubbed JWKS fetch, and sign test tickets with it. Run: node test/auth.test.mjs
@@ -38,10 +39,10 @@ let geminiAnswers = [];
 const realFetch = globalThis.fetch;
 globalThis.fetch = async (url) => {
   const u = String(url);
-  if (u.includes('/discovery/v2.0/keys')) return { ok: true, json: async () => ({ keys: [jwk] }) };
+  if (u.includes('/discovery/v2.0/keys')) return Response.json(normalizeNativeFixture(({ keys: [jwk] })),{status:200});
   if (u.includes('generativelanguage.googleapis.com')) {
     const text = geminiAnswers.length ? geminiAnswers.shift() : '{}';
-    return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text }] } }] }) };
+    return Response.json(normalizeNativeFixture(({ candidates: [{ content: { parts: [{ text }] } }] })),{status:200});
   }
   throw new Error('unexpected fetch in test: ' + u);
 };
@@ -93,18 +94,18 @@ ok(contentsOf({}) === null && contentsOf({ messages: [] }) === null, 'no prompt 
 const MODEL = 'gemini-3.7-flash';
 const schema = { type: 'object', required: ['kind'], properties: { kind: { type: 'string', enum: ['a', 'b'] } } };
 geminiAnswers = ['{"kind":"a"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
+r = await doRunPrompt({ GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, { prompt: 'p', schema, model: MODEL });
 ok(r.output && r.output.kind === 'a' && r.outputValid === true, 'valid first answer -> outputValid true');
 geminiAnswers = ['{"kind":"zzz"}', '{"kind":"b"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
-ok(r.output && r.output.kind === 'b' && r.outputValid === true, 'a bad first answer is retried once and corrected');
+r = await doRunPrompt({ GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, { prompt: 'p', schema, model: MODEL });
+ok(r.output && r.output.kind === 'zzz' && r.outputValid === false && geminiAnswers.length===1, 'invalid schema stops after one call; no automatic paid retry');
 geminiAnswers = ['{"kind":"zzz"}', '{"kind":"zzz"}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', schema, model: MODEL });
+r = await doRunPrompt({ GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, { prompt: 'p', schema, model: MODEL });
 ok(r.outputValid === false && r.output, 'twice-bad -> outputValid false, output still returned for review');
 geminiAnswers = ['{"anything":1}'];
-r = await doRunPrompt({ GEMINI_API_KEY: 'k' }, { prompt: 'p', model: MODEL });
+r = await doRunPrompt({ GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, { prompt: 'p', model: MODEL });
 ok(r.output && r.output.anything === 1 && r.raw === '{"anything":1}' && !('outputValid' in r), 'no schema -> raw passthrough, no fake outputValid');
-await throws(() => doRunPrompt({ GEMINI_API_KEY: 'k' }, {}), /prompt or messages required/, 'empty payload -> 400');
+await throws(() => doRunPrompt({ GEMINI_API_KEY: 'SYNTHETIC-GEMINI-KEY-ONLY' }, {}), /prompt or messages required/, 'empty payload -> 400');
 
 globalThis.fetch = realFetch;
 console.log(`\nauth+runPrompt: ${pass} pass, ${fail} fail`);

@@ -1,3 +1,4 @@
+import {normalizeNativeFixture} from './native-fixture.mjs';
 // Offline tests for v0.27: THE CALLER PICKS THE MODEL.
 //
 // The Worker used to hardcode gemini-3.1-flash-lite in six places, and only one
@@ -37,8 +38,10 @@ let urls = [];
 let answers = [];
 globalThis.fetch = async (url) => {
   urls.push(String(url));
+  if(String(url).includes('/models?'))return Response.json({models:[]});
   const text = answers.length ? answers.shift() : '{}';
-  return { ok: true, json: async () => ({ candidates: [{ content: { parts: [{ text }] } }] }) };
+  if(String(url).includes('api.groq.com'))return Response.json(normalizeNativeFixture({choices:[{message:{content:text}}]}));
+  return Response.json(normalizeNativeFixture(({ candidates: [{ content: { parts: [{ text }] } }] })),{status:200});
 };
 // The model sits between "/models/" and ":generateContent" in the request path.
 const modelsHit = () => urls.map(u => (u.match(/\/models\/([^:]+):generateContent/) || [])[1]);
@@ -110,7 +113,7 @@ await run(() => doClassify('k', { subject: 's', bodyText: 'b', model: 'gemini-3.
 eq(modelsHit()[0], 'gemini-3.7-flash', 'classify does too - it is the highest-volume task');
 
 reset('some text');
-await run(() => doVisionOcr('k', { images: [{ base64: 'AAA', mimeType: 'image/png' }], model: 'gemini-3.7-flash' }), 'visionOcr');
+await run(() => doVisionOcr('SYNTHETIC-GEMINI-KEY-ONLY', { images: [{ base64: 'AAA', mimeType: 'image/png' }], model: 'gemini-3.7-flash' }), 'visionOcr');
 eq(modelsHit()[0], 'gemini-3.7-flash', 'and so does the picture reader');
 
 // ---- 3. the validation retry must NOT change model --------------------------
@@ -120,9 +123,9 @@ eq(modelsHit()[0], 'gemini-3.7-flash', 'and so does the picture reader');
 reset('{"wrong":1}', '{"n":2}');
 const SCHEMA = { type: 'object', required: ['n'], properties: { n: { type: 'number' } } };
 const out = (await run(() => doRunPrompt(ENV, { prompt: 'hi', schema: SCHEMA, model: 'gemini-3.7-flash' }), 'runPrompt retry')) || {};
-eq(urls.length, 2, 'the schema retry really happened');
-eq(modelsHit()[1], 'gemini-3.7-flash', 'the retry goes back to the SAME model');
-ok(out.outputValid === true, 'and the corrected answer is accepted');
+eq(urls.length, 1, 'schema failure never repeats a paid call');
+eq(modelsHit()[0], 'gemini-3.7-flash', 'the one attempt uses the selected model');
+ok(out.outputValid === false, 'the invalid business result stays invalid');
 
 // ---- 4. a bad id stops the call, it does not downgrade it -------------------
 reset('{"ok":true}');
